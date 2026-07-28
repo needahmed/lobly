@@ -1,0 +1,77 @@
+{
+  "name": "apps-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LOBLY desktop client",
+  "author": "LOBLY",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "build:renderer": "vite build",
+    "build:electron": "node esbuild.mjs",
+    "build": "npm run build:renderer && npm run build:electron",
+    "start": "electron .",
+    "dev": "npm run build && npm run start",
+    "preview": "vite --port 5199",
+    "icons": "powershell -ExecutionPolicy Bypass -File ./assets/generate-icons.ps1",
+    "pack": "npm run icons && npm run build && electron-builder --win portable",
+    "pack:installer": "npm run icons && npm run build && electron-builder --win nsis"
+  },
+  "dependencies": {
+    "@lobly/client-core": "*",
+    "@lobly/lcu-endpoints": "*",
+    "@lobly/shared-types": "*",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "socket.io-client": "^4.8.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@types/ws": "^8.5.13",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "33.4.11",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7"
+  },
+  "build": {
+    "appId": "com.lobly.desktop",
+    "productName": "LOBLY",
+    "copyright": "Copyright © LOBLY",
+    "electronVersion": "33.4.11",
+    "directories": {
+      "output": "release",
+      "buildResources": "assets"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "icon": "assets/lobly.ico",
+      "signAndEditExecutable": false,
+      "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-portable.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "artifactName": "${productName}-${version}-setup.${ext}"
+    }
+  }
+}

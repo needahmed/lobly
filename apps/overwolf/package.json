@@ -1,0 +1,27 @@
+{
+  "name": "apps-overwolf",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build && node copy-manifest.mjs",
+    "build:watch": "vite build --watch"
+  },
+  "dependencies": {
+    "@lobly/client-core": "*",
+    "@lobly/lcu-endpoints": "*",
+    "@lobly/shared-types": "*",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "socket.io-client": "^4.8.1"
+  },
+  "devDependencies": {
+    "@overwolf/types": "^3.24.7",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7",
+    "vite-plugin-static-copy": "^2.2.0"
+  }
+}

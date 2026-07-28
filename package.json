@@ -1,0 +1,24 @@
+{
+  "name": "lobly",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*", "tools/*"],
+  "scripts": {
+    "ow:dev": "npm --workspace apps/overwolf run build:watch",
+    "ow:build": "npm --workspace apps/overwolf run build",
+    "mock": "npm --workspace tools/mock-backend run start",
+    "lcu": "npm --workspace tools/lcu-standalone run start --",
+    "api:dev": "npm --workspace apps/api run start:dev",
+    "api:build": "npm --workspace apps/api run build",
+    "api:start": "npm --workspace apps/api run start:prod",
+    "api:test": "npm --workspace apps/api run test",
+    "api:migration:run": "npm --workspace apps/api run migration:run",
+    "api:migration:revert": "npm --workspace apps/api run migration:revert",
+    "web:dev": "npm --workspace apps/web run dev",
+    "web:build": "npm --workspace apps/web run build",
+    "desktop:build": "npm --workspace apps/desktop run build",
+    "desktop:start": "npm --workspace apps/desktop run start",
+    "desktop:dev": "npm --workspace apps/desktop run dev",
+    "desktop:pack": "npm --workspace apps/desktop run pack",
+    "desktop:pack:installer": "npm --workspace apps/desktop run pack:installer"
+  }
+}

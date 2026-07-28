@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">LOBLY</title>
+  <defs>
+    <linearGradient id="surface" x1="28" y1="18" x2="226" y2="238" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#121C31"/>
+      <stop offset="1" stop-color="#070B14"/>
+    </linearGradient>
+    <linearGradient id="energy" x1="64" y1="54" x2="186" y2="184" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#42E8FF"/>
+      <stop offset=".54" stop-color="#638BFF"/>
+      <stop offset="1" stop-color="#A56EFF"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#surface)"/>
+  <path d="M128 29 211 77v102l-83 48-83-48V77l83-48Z" fill="none" stroke="#223454" stroke-width="7"/>
+  <path d="M69 57h31v91h69v31H69V57Z" fill="url(#energy)"/>
+  <path d="m170 60 16 16-16 16-16-16 16-16Zm0 46 12 12-12 12-12-12 12-12Z" fill="#D7F8FF"/>
+</svg>

@@ -1,0 +1,10 @@
+{
+  "name": "@lobly/lcu-endpoints",
+  "version": "0.1.0",
+  "private": true,
+  "main": "endpoints.json",
+  "exports": {
+    ".": "./endpoints.json",
+    "./endpoints.json": "./endpoints.json"
+  }
+}

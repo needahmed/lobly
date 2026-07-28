@@ -1,0 +1,12 @@
+{
+  "name": "tools-lcu-standalone",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/cli.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

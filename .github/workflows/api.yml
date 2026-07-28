@@ -1,0 +1,59 @@
+name: API
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/api/**"
+      - "packages/**"
+      - "package.json"
+      - ".github/workflows/api.yml"
+  pull_request:
+    paths:
+      - "apps/api/**"
+      - "packages/**"
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: lobly
+          POSTGRES_PASSWORD: lobly
+          POSTGRES_DB: lobly
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lobly -d lobly"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://lobly:lobly@localhost:5432/lobly
+      REDIS_URL: redis://localhost:6379
+      JWT_SECRET: ci-access-secret-min-32-characters!!
+      JWT_REFRESH_SECRET: ci-refresh-secret-min-32-characters!
+      RIOT_API_KEY: RGAPI-ci-placeholder-key
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm install
+      - run: npm run api:build
+      - run: npm run api:test
+      - run: npm run api:migration:run

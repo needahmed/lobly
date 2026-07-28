@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+apps/overwolf/dist/
+apps/desktop/dist/
+apps/desktop/dist-electron/
+apps/desktop/release/
+apps/desktop/assets/lobly.ico
+apps/desktop/assets/lobly.png
+*.local
