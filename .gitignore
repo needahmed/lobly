@@ -12,3 +12,6 @@ apps/desktop/release/
 apps/desktop/assets/lobly.ico
 apps/desktop/assets/lobly.png
 *.local
+# tsc emit written beside TypeScript sources
+packages/shared-types/src/**/*.js
+packages/client-core/src/**/*.js
