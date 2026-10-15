@@ -15,3 +15,4 @@ export { Block } from "./block.entity";
 export { Report } from "./report.entity";
 export { ChatMessage } from "./chat-message.entity";
 export { MetricsEvent } from "./metrics-event.entity";
+export { GameReport } from "./game-report.entity";

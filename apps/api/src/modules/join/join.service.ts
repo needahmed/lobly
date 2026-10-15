@@ -1,14 +1,18 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
+  HttpException,
+  HttpStatus,
+  Inject,
   Injectable,
   NotFoundException,
+  forwardRef,
 } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
 import { InjectQueue } from "@nestjs/bullmq";
-import { Inject } from "@nestjs/common";
 import { Queue } from "bullmq";
-import { DataSource, In, Repository } from "typeorm";
+import { DataSource, In, MoreThanOrEqual, Repository } from "typeorm";
 import type Redis from "ioredis";
 import { BLOCKED_PLATFORMS } from "@lobly/riot-client";
 import {
@@ -17,6 +21,7 @@ import {
   normalizeSlots,
   slotAcceptsRole,
   type Role,
+  type SessionActivePayload,
 } from "@lobly/shared-types";
 import {
   JoinRequest,
@@ -24,6 +29,7 @@ import {
   RiotAccount,
   UserPrefs,
 } from "../../database/entities";
+import { JoinCleanupService } from "./join-cleanup.service";
 import { REDIS_CLIENT } from "../../common/redis/redis.constants";
 import { ProfileService } from "../profile/profile.service";
 import { evaluateEligibility } from "../lobby/eligibility";
@@ -35,7 +41,9 @@ import { ReputationService } from "../reputation/reputation.service";
 import { MetricsService } from "../metrics/metrics.service";
 import { SessionService } from "../session/session.service";
 
-export const JOIN_QUEUE = "join-timeouts";
+import { JOIN_QUEUE } from "./join.constants";
+
+export { JOIN_QUEUE };
 
 @Injectable()
 export class JoinService {
@@ -52,11 +60,15 @@ export class JoinService {
     private readonly dataSource: DataSource,
     private readonly profiles: ProfileService,
     private readonly boardCache: BoardCacheService,
+    @Inject(forwardRef(() => ListingsService))
     private readonly listingsService: ListingsService,
+    @Inject(forwardRef(() => RealtimeFanoutService))
     private readonly fanout: RealtimeFanoutService,
     private readonly reputation: ReputationService,
     private readonly metrics: MetricsService,
-    private readonly sessions: SessionService
+    @Inject(forwardRef(() => SessionService))
+    private readonly sessions: SessionService,
+    private readonly cleanup: JoinCleanupService
   ) {}
 
   async requestJoin(
@@ -104,6 +116,29 @@ export class JoinService {
       },
     });
     if (pending) throw new BadRequestException({ code: "ALREADY_PENDING" });
+
+    const myIds = (await this.accounts.find({ where: { userId } })).map(
+      (a) => a.id
+    );
+    const acceptedElsewhere = await this.joins.findOne({
+      where: { requesterAccountId: In(myIds), status: "ACCEPTED" },
+    });
+    if (acceptedElsewhere) {
+      throw new ConflictException({ code: "ALREADY_ACCEPTED_ELSEWHERE" });
+    }
+    const pendingCount = await this.joins.count({
+      where: { requesterAccountId: In(myIds), status: "PENDING" },
+    });
+    if (pendingCount >= 3) {
+      throw new HttpException(
+        { code: "TOO_MANY_PENDING" },
+        HttpStatus.TOO_MANY_REQUESTS
+      );
+    }
+    const active = await this.sessions.findActiveSummaryForUser(userId);
+    if (active && active.endedAt == null) {
+      throw new ConflictException({ code: "IN_SESSION" });
+    }
 
     if (
       await this.reputation.isBlockedEitherWay(
@@ -188,10 +223,20 @@ export class JoinService {
       })
     );
 
-    const card = await this.profiles.getCard(requester.id);
+    await this.queue.add(
+      "pending-timeout",
+      { joinRequestId: row.id },
+      {
+        delay: 10 * 60_000,
+        jobId: `join-pending-${row.id}`,
+        removeOnComplete: true,
+      }
+    );
+
     const creator = await this.accounts.findOne({
       where: { id: listing.creatorAccountId },
     });
+    const card = await this.profiles.getCard(requester.id, creator?.userId);
 
     await this.metrics.log("join_requested", {
       accountId: requester.id,
@@ -249,26 +294,62 @@ export class JoinService {
       throw new BadRequestException({ code: "INVITEE_NO_SUMMONER_ID" });
     }
 
-    await this.dataSource.transaction(async (manager) => {
-      jr.status = "ACCEPTED";
+    const online = await this.redis.exists(`presence:${invitee.userId}`);
+    if (!online) {
+      jr.status = "EXPIRED";
       jr.decidedAt = new Date();
-      await manager.save(jr);
+      await this.joins.save(jr);
+      await this.removeJobs(jr.id);
+      throw new ConflictException({ code: "REQUESTER_OFFLINE" });
+    }
 
-      listing.status = ListingStatus.FILLING;
-      const slots = normalizeSlots(listing.slots);
-      const wanted = jr.roleSlot as Role | null;
+    await this.dataSource.transaction(async (manager) => {
+      const locked = await manager.findOne(Listing, {
+        where: { id: listing.id },
+        lock: { mode: "pessimistic_write" },
+      });
+      if (!locked) throw new NotFoundException({ code: "LISTING_GONE" });
+
+      const open =
+        locked.status === ListingStatus.LISTED ||
+        locked.status === ListingStatus.FILLING;
+      if (!open || locked.expiresAt.getTime() <= Date.now()) {
+        throw new BadRequestException({ code: "LISTING_NOT_OPEN" });
+      }
+
+      const fresh = await manager.findOne(JoinRequest, {
+        where: { id: jr.id },
+      });
+      if (!fresh || fresh.status !== "PENDING") {
+        throw new BadRequestException({ code: "NOT_PENDING" });
+      }
+
+      const slots = normalizeSlots(locked.slots);
+      const wanted = fresh.roleSlot as Role | null;
       const idx = wanted
         ? slots.findIndex((s) => s.open && slotAcceptsRole(s.roles, wanted))
         : slots.findIndex((s) => s.open);
-      if (idx >= 0) {
-        slots[idx] = {
-          ...slots[idx],
-          open: false,
-          pendingAccountId: jr.requesterAccountId,
-        };
-        listing.slots = slots;
+      if (idx < 0) {
+        throw new ConflictException({ code: "NO_SLOT" });
       }
-      await manager.save(listing);
+
+      fresh.status = "ACCEPTED";
+      fresh.decidedAt = new Date();
+      await manager.save(fresh);
+
+      slots[idx] = {
+        ...slots[idx],
+        open: false,
+        pendingAccountId: fresh.requesterAccountId,
+      };
+      locked.status = ListingStatus.FILLING;
+      locked.slots = slots;
+      await manager.save(locked);
+
+      jr.status = fresh.status;
+      jr.decidedAt = fresh.decidedAt;
+      listing.status = locked.status;
+      listing.slots = locked.slots;
     });
 
     await this.reputation.recordEvent(jr.requesterAccountId, "ACCEPTED", {
@@ -281,11 +362,17 @@ export class JoinService {
     });
     await this.boardCache.invalidate(listing.platform, listing.queueId);
 
+    await this.removeJobs(jr.id);
     const expiresAt = new Date(Date.now() + 90_000);
     await this.queue.add(
       "timeout",
       { joinRequestId: jr.id },
       { delay: 90_000, jobId: `join-timeout-${jr.id}`, removeOnComplete: true }
+    );
+    await this.cleanup.closePendingForRequester(
+      invitee.userId,
+      "ACCEPTED_ELSEWHERE",
+      jr.id
     );
 
     const creator = listing.creatorAccount;
@@ -337,6 +424,7 @@ export class JoinService {
     jr.status = "DECLINED";
     jr.decidedAt = new Date();
     await this.joins.save(jr);
+    await this.removeJobs(jr.id);
 
     const requester = await this.accounts.findOne({
       where: { id: jr.requesterAccountId },
@@ -365,7 +453,25 @@ export class JoinService {
     if (!listing || listing.creatorAccount.userId !== userId) {
       throw new ForbiddenException({ code: "NOT_OWNER" });
     }
-    if (body.ok) return { ok: true };
+    if (body.ok) {
+      try {
+        await this.queue.remove(`join-timeout-${jr.id}`);
+      } catch {
+        /* ignore */
+      }
+      jr.inviteSentAt = new Date();
+      await this.joins.save(jr);
+      await this.queue.add(
+        "timeout",
+        { joinRequestId: jr.id },
+        {
+          delay: 90_000,
+          jobId: `join-timeout-${jr.id}`,
+          removeOnComplete: true,
+        }
+      );
+      return { ok: true };
+    }
     await this.failJoin(jr, listing, "INVITE_FAILED");
     return { ok: true, reopened: true };
   }
@@ -377,13 +483,80 @@ export class JoinService {
       where: { id: jr.requesterAccountId, userId },
     });
     if (!requester) throw new ForbiddenException({ code: "NOT_REQUESTER" });
-    if (jr.status !== "PENDING") {
-      throw new BadRequestException({ code: "NOT_PENDING" });
+    if (jr.status !== "PENDING" && jr.status !== "ACCEPTED") {
+      throw new BadRequestException({ code: "NOT_CANCELLABLE" });
     }
+
+    const listing = await this.listings.findOne({
+      where: { id: jr.listingId },
+      relations: { creatorAccount: true },
+    });
+    const wasAccepted = jr.status === "ACCEPTED";
     jr.status = "CANCELLED";
     jr.decidedAt = new Date();
     await this.joins.save(jr);
+    await this.removeJobs(jr.id);
+
+    if (wasAccepted) {
+      if (listing) {
+        await this.reopenSlot(listing, jr.requesterAccountId);
+        if (listing.creatorAccount) {
+          await this.fanout.emitToUser(
+            listing.creatorAccount.userId,
+            SocketEvents.JOIN_REOPENED,
+            { listingId: listing.id, joinRequestId: jr.id }
+          );
+        }
+      }
+      await this.reputation.recordEvent(
+        jr.requesterAccountId,
+        "CANCELLED_AFTER_ACCEPT",
+        { joinRequestId: jr.id }
+      );
+    } else if (listing?.creatorAccount) {
+      await this.fanout.emitToUser(
+        listing.creatorAccount.userId,
+        SocketEvents.JOIN_CANCELLED,
+        { joinRequestId: jr.id }
+      );
+    }
     return { ok: true };
+  }
+
+  async listMine(userId: string) {
+    const mine = await this.accounts.find({ where: { userId } });
+    if (!mine.length) return [];
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const rows = await this.joins.find({
+      where: {
+        requesterAccountId: In(mine.map((a) => a.id)),
+        createdAt: MoreThanOrEqual(since),
+      },
+      order: { createdAt: "DESC" },
+    });
+    const listingIds = [...new Set(rows.map((r) => r.listingId))];
+    const listings = listingIds.length
+      ? await this.listings.find({
+          where: { id: In(listingIds) },
+          relations: { creatorAccount: true },
+        })
+      : [];
+    const byId = new Map(listings.map((l) => [l.id, l]));
+    return rows.map((r) => {
+      const listing = byId.get(r.listingId) ?? null;
+      return {
+        id: r.id,
+        listingId: r.listingId,
+        status: r.status,
+        roleSlot: r.roleSlot,
+        createdAt: r.createdAt.toISOString(),
+        listing: listing ? this.listingsService.toSummary(listing) : null,
+        creator: {
+          riotId: listing?.creatorAccount?.riotId ?? "",
+          tagLine: listing?.creatorAccount?.tagLine ?? "",
+        },
+      };
+    });
   }
 
   async listForListing(userId: string, listingId: string) {
@@ -401,7 +574,7 @@ export class JoinService {
     });
     const out = [];
     for (const r of rows) {
-      const card = await this.profiles.getCard(r.requesterAccountId);
+      const card = await this.profiles.getCard(r.requesterAccountId, userId);
       out.push({
         id: r.id,
         status: r.status,
@@ -440,11 +613,40 @@ export class JoinService {
     );
     if (!allowed) throw new ForbiddenException({ code: "NOT_PARTY" });
 
-    try {
-      await this.queue.remove(`join-timeout-${jr.id}`);
-    } catch {
-      /* ignore */
+    return this.finishLobbyConfirmed(jr, listing);
+  }
+
+  /**
+   * Server-side LOBBY_CONFIRMED for PENDING/ACCEPTED joins whose requester
+   * is now sitting in the creator's League party. The client confirmLobby
+   * path is unchanged.
+   */
+  async confirmLobbyFromParty(
+    listing: Listing,
+    memberAccountIds: string[]
+  ): Promise<void> {
+    const ids = [...new Set(memberAccountIds.filter(Boolean))];
+    if (!ids.length) return;
+    const rows = await this.joins.find({
+      where: {
+        listingId: listing.id,
+        status: In(["PENDING", "ACCEPTED"]),
+        requesterAccountId: In(ids),
+      },
+    });
+    for (const jr of rows) {
+      const fresh = await this.listings.findOne({
+        where: { id: listing.id },
+        relations: { creatorAccount: true },
+      });
+      if (!fresh) return;
+      if (jr.status !== "PENDING" && jr.status !== "ACCEPTED") continue;
+      await this.finishLobbyConfirmed(jr, fresh);
     }
+  }
+
+  private async finishLobbyConfirmed(jr: JoinRequest, listing: Listing) {
+    await this.removeJobs(jr.id);
 
     jr.status = "COMPLETED";
     jr.decidedAt = jr.decidedAt ?? new Date();
@@ -460,6 +662,9 @@ export class JoinService {
     listing.slots = slots;
     await this.listings.save(listing);
     await this.boardCache.invalidate(listing.platform, listing.queueId);
+    if (!openLeft) {
+      this.listingsService.emitListingClosed(listing.id, "LOBBY_FULL");
+    }
 
     await this.reputation.recordEvent(jr.requesterAccountId, "SHOWED", {
       joinRequestId: jr.id,
@@ -489,7 +694,9 @@ export class JoinService {
         sessionId: session.id,
         memberAccountIds: session.memberAccountIds,
         chatOpen: true,
-      });
+        endedAt: session.endedAt?.toISOString() ?? null,
+        chatOpenUntil: session.chatOpenUntil?.toISOString() ?? null,
+      } satisfies SessionActivePayload);
       await this.fanout.joinSessionRoom(acc.userId, session.id);
     }
 
@@ -510,6 +717,11 @@ export class JoinService {
       relations: { creatorAccount: true },
     });
     if (!listing) return;
+
+    if (!jr.inviteSentAt) {
+      await this.failJoin(jr, listing, "INVITE_NOT_SENT");
+      return;
+    }
 
     jr.status = "NO_SHOW";
     jr.decidedAt = new Date();
@@ -544,19 +756,33 @@ export class JoinService {
     }
   }
 
-  async memberLeft(userId: string, accountId: string) {
-    const mine = await this.accounts.find({ where: { userId } });
-    if (!mine.length) return { ok: true };
-
-    const row = await this.listings.findOne({
-      where: {
-        creatorAccountId: In(mine.map((a) => a.id)),
-        status: ListingStatus.READY,
-      },
+  async handlePendingTimeout(joinRequestId: string) {
+    const jr = await this.joins.findOne({ where: { id: joinRequestId } });
+    if (!jr || jr.status !== "PENDING") return;
+    jr.status = "EXPIRED";
+    jr.decidedAt = new Date();
+    await this.joins.save(jr);
+    const requester = await this.accounts.findOne({
+      where: { id: jr.requesterAccountId },
     });
-    if (!row) return { ok: true };
+    if (requester) {
+      await this.fanout.emitToUser(requester.userId, SocketEvents.JOIN_FAILED, {
+        joinRequestId: jr.id,
+        code: "EXPIRED",
+      });
+    }
+  }
+
+  async memberLeft(userId: string, accountId: string) {
+    const detached = await this.sessions.detachOpenMember(userId, accountId);
+    if (!detached || !detached.beforeQueue) return { ok: true };
 
     await this.reputation.recordEvent(accountId, "ABANDONED");
+    const row = await this.listings.findOne({
+      where: { id: detached.listingId },
+      relations: { creatorAccount: true },
+    });
+    if (!row) return { ok: true };
     await this.reopenSlot(row, accountId);
     await this.fanout.emitToUser(userId, SocketEvents.JOIN_REOPENED, {
       listingId: row.id,
@@ -564,15 +790,24 @@ export class JoinService {
     return { ok: true };
   }
 
+  private async removeJobs(joinRequestId: string): Promise<void> {
+    for (const jobId of [
+      `join-pending-${joinRequestId}`,
+      `join-timeout-${joinRequestId}`,
+    ]) {
+      try {
+        await this.queue.remove(jobId);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   private async failJoin(jr: JoinRequest, listing: Listing, code: string) {
     jr.status = "EXPIRED";
     jr.decidedAt = new Date();
     await this.joins.save(jr);
-    try {
-      await this.queue.remove(`join-timeout-${jr.id}`);
-    } catch {
-      /* ignore */
-    }
+    await this.removeJobs(jr.id);
     await this.reopenSlot(listing, jr.requesterAccountId);
 
     const requester = await this.accounts.findOne({
@@ -639,5 +874,20 @@ export class JoinService {
       discordReveal: prefsRow.discordReveal,
       autoAcceptLoblyInvites: prefsRow.autoAcceptLoblyInvites,
     };
+  }
+
+  /** Withdraw every outgoing PENDING and ACCEPTED request (account unlink). */
+  async cancelOutgoingForUser(userId: string): Promise<void> {
+    const mine = await this.accounts.find({ where: { userId } });
+    if (!mine.length) return;
+    const rows = await this.joins.find({
+      where: {
+        requesterAccountId: In(mine.map((a) => a.id)),
+        status: In(["PENDING", "ACCEPTED"]),
+      },
+    });
+    for (const jr of rows) {
+      await this.cancel(userId, jr.id);
+    }
   }
 }

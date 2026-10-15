@@ -9,18 +9,21 @@ export function computeReliabilityScore(
   let abandoned = 0;
   let showed = 0;
   let completed = 0;
+  let cancelledAfterAccept = 0;
   for (const e of events) {
     const k = e.kind as ReliabilityKind;
     if (k === "NO_SHOW") noshow++;
     else if (k === "ABANDONED") abandoned++;
     else if (k === "SHOWED") showed++;
     else if (k === "COMPLETED") completed++;
+    else if (k === "CANCELLED_AFTER_ACCEPT") cancelledAfterAccept++;
   }
 
   let score =
     100 -
     15 * noshow -
-    20 * abandoned +
+    20 * abandoned -
+    5 * cancelledAfterAccept +
     Math.min(10, 1 * showed) +
     Math.min(10, 2 * completed);
   if (score < 0) score = 0;

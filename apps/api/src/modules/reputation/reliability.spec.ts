@@ -16,6 +16,16 @@ describe("computeReliabilityScore", () => {
     expect(score).toBe(68);
   });
 
+  it("weights CANCELLED_AFTER_ACCEPT as -5 and clamps to 0..100", () => {
+    expect(
+      computeReliabilityScore([{ kind: "CANCELLED_AFTER_ACCEPT" }])
+    ).toBe(95);
+    const many = Array.from({ length: 30 }, () => ({
+      kind: "CANCELLED_AFTER_ACCEPT",
+    }));
+    expect(computeReliabilityScore(many)).toBe(0);
+  });
+
   it("caps bonuses at +10 each", () => {
     const events = [
       ...Array.from({ length: 20 }, () => ({ kind: "SHOWED" })),

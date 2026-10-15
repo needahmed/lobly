@@ -1,11 +1,18 @@
 import {
   ForbiddenException,
+  Inject,
   Injectable,
   NotFoundException,
+  forwardRef,
 } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
-import { ArrayContains, IsNull, Not, Repository } from "typeorm";
-import { ListingStatus, SocketEvents } from "@lobly/shared-types";
+import { ArrayContains, In, IsNull, Not, Repository } from "typeorm";
+import {
+  ListingStatus,
+  SocketEvents,
+  type ChatMessagePayload,
+  type SessionSummary,
+} from "@lobly/shared-types";
 import {
   ChatMessage,
   JoinRequest,
@@ -19,8 +26,8 @@ import { RealtimeFanoutService } from "../realtime/realtime-fanout.service";
 import { ReputationService } from "../reputation/reputation.service";
 import { MetricsService } from "../metrics/metrics.service";
 import { ProfileService } from "../profile/profile.service";
+import { JoinCleanupService } from "../join/join-cleanup.service";
 import { replaceProfanity } from "../../common/profanity";
-import { Inject } from "@nestjs/common";
 import { REDIS_CLIENT } from "../../common/redis/redis.constants";
 import type Redis from "ioredis";
 import { ConfigService } from "@nestjs/config";
@@ -38,12 +45,15 @@ export class SessionService {
     private readonly joins: Repository<JoinRequest>,
     private readonly boardCache: BoardCacheService,
     private readonly listingsService: ListingsService,
+    @Inject(forwardRef(() => RealtimeFanoutService))
     private readonly fanout: RealtimeFanoutService,
     private readonly reputation: ReputationService,
     private readonly metrics: MetricsService,
     private readonly profiles: ProfileService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
-    private readonly config: ConfigService
+    private readonly config: ConfigService,
+    @Inject(forwardRef(() => JoinCleanupService))
+    private readonly joinCleanup: JoinCleanupService
   ) {}
 
   async createOrAttach(
@@ -64,9 +74,11 @@ export class SessionService {
     return this.sessions.save(
       this.sessions.create({
         listingId: listing.id,
+        source: "LISTING",
         memberAccountIds: [...new Set(memberAccountIds)],
         leagueLobbyConfirmedAt: new Date(),
         gamesPlayed: 0,
+        riotVerifiedGameIds: [],
       })
     );
   }
@@ -89,22 +101,29 @@ export class SessionService {
       session.startedQueueAt = new Date();
       await this.sessions.save(session);
     }
-    const listing = await this.listings.findOne({
-      where: { id: session.listingId },
-    });
-    if (listing) {
-      listing.status = ListingStatus.IN_SESSION;
-      await this.listings.save(listing);
-      await this.boardCache.invalidate(listing.platform, listing.queueId);
-      await this.fanout.emitBoardRemove(
-        listing.platform,
-        listing.queueId,
-        listing.id
-      );
-      await this.fanout.emitListingState(listing.creatorAccountId, {
-        listingId: listing.id,
-        status: listing.status,
+    const activeListingId = session.listingId;
+    if (activeListingId) {
+      const listing = await this.listings.findOne({
+        where: { id: activeListingId },
       });
+      if (listing) {
+        listing.status = ListingStatus.IN_SESSION;
+        await this.listings.save(listing);
+        await this.boardCache.invalidate(listing.platform, listing.queueId);
+        await this.fanout.emitBoardRemove(
+          listing.platform,
+          listing.queueId,
+          listing.id
+        );
+        await this.fanout.emitListingState(listing.creatorAccountId, {
+          listingId: listing.id,
+          status: listing.status,
+        });
+      }
+      await this.joinCleanup.closePendingForListing(
+        activeListingId,
+        "LOBBY_IN_GAME"
+      );
     }
     return { ok: true, sessionId: session.id };
   }
@@ -116,19 +135,6 @@ export class SessionService {
     const session = await this.findActiveForUser(userId, opts.listingId);
     if (!session) return { ok: true };
 
-    // Debounce games_played increments (5 min)
-    const debounceKey = `session:game:${session.id}`;
-    const recent = await this.redis.get(debounceKey);
-    if (!recent) {
-      session.gamesPlayed += 1;
-      await this.redis.setex(debounceKey, 300, "1");
-    }
-
-    // Event-driven profile refresh for members
-    for (const accountId of session.memberAccountIds) {
-      void this.profiles.ensureFresh(accountId, "game_ended");
-    }
-
     const final =
       opts.final === true ||
       opts.observedPhase === "None" ||
@@ -138,6 +144,10 @@ export class SessionService {
       session.endedAt = new Date();
       session.chatOpenUntil = new Date(Date.now() + 10 * 60 * 1000);
       await this.sessions.save(session);
+      await this.fanout.emitToSession(session.id, SocketEvents.SESSION_ENDED, {
+        sessionId: session.id,
+        chatOpenUntil: session.chatOpenUntil.toISOString(),
+      });
 
       for (const accountId of session.memberAccountIds) {
         await this.reputation.recordEvent(accountId, "COMPLETED", {
@@ -147,7 +157,7 @@ export class SessionService {
 
       await this.metrics.log("session_completed", {
         sessionId: session.id,
-        listingId: session.listingId,
+        listingId: session.listingId ?? undefined,
       });
 
       // repeat_pair if these members completed before
@@ -163,14 +173,16 @@ export class SessionService {
         if (prior > 0) {
           await this.metrics.log("repeat_pair", {
             sessionId: session.id,
-            listingId: session.listingId,
+            listingId: session.listingId ?? undefined,
           });
         }
       }
 
-      const listing = await this.listings.findOne({
-        where: { id: session.listingId },
-      });
+      const listing = session.listingId
+        ? await this.listings.findOne({
+            where: { id: session.listingId },
+          })
+        : null;
       if (listing) {
         listing.status = ListingStatus.POST_SESSION;
         await this.listings.save(listing);
@@ -179,33 +191,24 @@ export class SessionService {
           status: listing.status,
         });
       }
-
-      // Endorse prompts
-      for (const accountId of session.memberAccountIds) {
-        const acc = await this.accounts.findOne({ where: { id: accountId } });
-        if (!acc) continue;
-        const others = [];
-        for (const oid of session.memberAccountIds) {
-          if (oid === accountId) continue;
-          const o = await this.accounts.findOne({ where: { id: oid } });
-          if (o) {
-            others.push({
-              accountId: o.id,
-              riotId: o.riotId,
-              tagLine: o.tagLine,
-            });
-          }
-        }
-        await this.fanout.emitToUser(acc.userId, SocketEvents.ENDORSE_PROMPT, {
-          sessionId: session.id,
-          others,
-        });
-      }
     } else {
       await this.sessions.save(session);
     }
 
     return { ok: true, sessionId: session.id, gamesPlayed: session.gamesPlayed };
+  }
+
+  /**
+   * Count a Riot-confirmed game once. `riotVerifiedGameIds` is the set, so a
+   * replayed game id does not increment gamesPlayed again.
+   */
+  async onGameEnded(session: Session, gameId: number): Promise<Session> {
+    const current = (session.riotVerifiedGameIds ?? []).map((id) => String(id));
+    const key = String(gameId);
+    if (current.includes(key)) return session;
+    session.riotVerifiedGameIds = [...current, key];
+    session.gamesPlayed = (session.gamesPlayed ?? 0) + 1;
+    return this.sessions.save(session);
   }
 
   async sendChat(userId: string, sessionId: string, body: string) {
@@ -254,20 +257,37 @@ export class SessionService {
     return payload;
   }
 
-  async history(userId: string, sessionId: string) {
+  async history(
+    userId: string,
+    sessionId: string
+  ): Promise<ChatMessagePayload[]> {
     await this.requireMember(userId, sessionId);
     const rows = await this.messages.find({
       where: { sessionId },
       order: { createdAt: "DESC" },
       take: 100,
     });
-    return rows.reverse().map((m) => ({
-      id: Number(m.id),
-      sessionId: m.sessionId,
-      fromAccountId: m.fromAccountId,
-      body: m.body,
-      createdAt: m.createdAt.toISOString(),
-    }));
+    const ordered = rows.reverse();
+    if (!ordered.length) return [];
+    const accountIds = [...new Set(ordered.map((m) => m.fromAccountId))];
+    const authors = await this.accounts.find({
+      where: { id: In(accountIds) },
+    });
+    const byId = new Map(authors.map((a) => [a.id, a]));
+    return ordered.map((m) => {
+      const from = byId.get(m.fromAccountId);
+      return {
+        id: Number(m.id),
+        sessionId: m.sessionId,
+        from: {
+          accountId: m.fromAccountId,
+          riotId: from?.riotId ?? "",
+          tagLine: from?.tagLine ?? "",
+        },
+        body: m.body,
+        at: m.createdAt.toISOString(),
+      };
+    });
   }
 
   async purgeOldChat(): Promise<number> {
@@ -279,6 +299,76 @@ export class SessionService {
       .where("created_at < :cutoff", { cutoff })
       .execute();
     return result.affected ?? 0;
+  }
+
+  /**
+   * Drop accountId from an open session on a listing this user created.
+   * beforeQueue is true when the lobby had not started queue yet.
+   */
+  async detachOpenMember(
+    creatorUserId: string,
+    accountId: string
+  ): Promise<{ listingId: string; beforeQueue: boolean } | null> {
+    const mine = await this.accounts.find({ where: { userId: creatorUserId } });
+    if (!mine.length) return null;
+    const owned = await this.listings.find({
+      where: { creatorAccountId: In(mine.map((a) => a.id)) },
+    });
+    for (const listing of owned) {
+      const session = await this.sessions.findOne({
+        where: { listingId: listing.id, endedAt: IsNull() },
+      });
+      if (!session || !session.memberAccountIds.includes(accountId)) continue;
+      const beforeQueue = session.startedQueueAt == null;
+      session.memberAccountIds = session.memberAccountIds.filter(
+        (id) => id !== accountId
+      );
+      await this.sessions.save(session);
+      return { listingId: listing.id, beforeQueue };
+    }
+    return null;
+  }
+
+  /**
+   * End abandoned open sessions. Does not record COMPLETED or prompt endorsements.
+   */
+  async sweepIdleSessions(now = new Date()): Promise<number> {
+    const open = await this.sessions.find({ where: { endedAt: IsNull() } });
+    const sixHours = 6 * 60 * 60 * 1000;
+    const idleAfter = 30 * 60 * 1000;
+    let ended = 0;
+    for (const session of open) {
+      const created = session.createdAt.getTime();
+      const tooOld = created < now.getTime() - sixHours;
+      if (!tooOld) {
+        const last = Math.max(
+          session.startedQueueAt?.getTime() ?? 0,
+          session.leagueLobbyConfirmedAt?.getTime() ?? 0,
+          created
+        );
+        if (last >= now.getTime() - idleAfter) continue;
+        if (!(await this.nobodyPresent(session.memberAccountIds))) continue;
+      }
+      session.endedAt = new Date(now.getTime());
+      session.chatOpenUntil = new Date(now.getTime());
+      await this.sessions.save(session);
+      ended++;
+    }
+    return ended;
+  }
+
+  private async nobodyPresent(accountIds: string[]): Promise<boolean> {
+    if (!accountIds.length) return true;
+    const accounts = await this.accounts.find({
+      where: { id: In(accountIds) },
+    });
+    const userIds = [...new Set(accounts.map((a) => a.userId))];
+    if (!userIds.length) return true;
+    for (const userId of userIds) {
+      const present = await this.redis.exists(`presence:${userId}`);
+      if (present) return false;
+    }
+    return true;
   }
 
   private assertChatOpen(session: Session) {
@@ -313,9 +403,12 @@ export class SessionService {
     const ids = mine.map((a) => a.id);
 
     if (listingId) {
-      return this.sessions.findOne({
+      const session = await this.sessions.findOne({
         where: { listingId, endedAt: IsNull() },
       });
+      if (!session) return null;
+      const member = session.memberAccountIds.some((id) => ids.includes(id));
+      return member ? session : null;
     }
 
     // Find any open session containing one of my accounts
@@ -342,6 +435,26 @@ export class SessionService {
       }
     }
     return null;
+  }
+
+  /**
+   * Open session, or a recently ended one still inside the chat window.
+   * SessionSummary fields plus sessionId/chatOpen for SESSION_ACTIVE reconcile.
+   */
+  async findActiveSummaryForUser(
+    userId: string
+  ): Promise<(SessionSummary & { sessionId: string; chatOpen: boolean }) | null> {
+    const session = await this.findActiveForUser(userId);
+    if (!session) return null;
+    const chatOpen =
+      !session.endedAt ||
+      (session.chatOpenUntil != null &&
+        session.chatOpenUntil.getTime() > Date.now());
+    return {
+      ...this.toSummary(session),
+      sessionId: session.id,
+      chatOpen,
+    };
   }
 
   private toSummary(session: Session) {

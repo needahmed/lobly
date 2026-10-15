@@ -12,6 +12,7 @@ import { RealtimeModule } from "../realtime/realtime.module";
 import { ReputationModule } from "../reputation/reputation.module";
 import { MetricsModule } from "../metrics/metrics.module";
 import { ProfileModule } from "../profile/profile.module";
+import { JoinModule } from "../join/join.module";
 import { SessionController } from "./session.controller";
 import { SessionService } from "./session.service";
 import {
@@ -19,6 +20,11 @@ import {
   ChatRetentionProcessor,
   ChatRetentionService,
 } from "./chat-retention.service";
+import {
+  SESSION_SWEEPER_QUEUE,
+  SessionSweeperProcessor,
+  SessionSweeperService,
+} from "./session-sweeper.service";
 import { BullModule } from "@nestjs/bullmq";
 
 
@@ -32,6 +38,8 @@ import { BullModule } from "@nestjs/bullmq";
       JoinRequest,
     ]),
     BullModule.registerQueue({ name: CHAT_RETENTION_QUEUE }),
+    BullModule.registerQueue({ name: SESSION_SWEEPER_QUEUE }),
+    forwardRef(() => JoinModule),
     forwardRef(() => LobbyModule),
     forwardRef(() => RealtimeModule),
     forwardRef(() => ReputationModule),
@@ -39,7 +47,13 @@ import { BullModule } from "@nestjs/bullmq";
     ProfileModule,
   ],
   controllers: [SessionController],
-  providers: [SessionService, ChatRetentionService, ChatRetentionProcessor],
+  providers: [
+    SessionService,
+    ChatRetentionService,
+    ChatRetentionProcessor,
+    SessionSweeperService,
+    SessionSweeperProcessor,
+  ],
   exports: [SessionService],
 })
 export class SessionModule {}

@@ -2,18 +2,22 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  Inject,
   Injectable,
   NotFoundException,
-  ServiceUnavailableException,
+  forwardRef,
 } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
-import { BLOCKED_PLATFORMS, RiotHttpError, isKnownPlatform } from "@lobly/riot-client";
+import { BLOCKED_PLATFORMS, isKnownPlatform } from "@lobly/riot-client";
 import type { RiotAccountDto } from "@lobly/shared-types";
 import { ChampionStat, MatchSeen, ProfileSnapshot, RiotAccount } from "../../database/entities";
-import { RiotService } from "../riot/riot.service";
 import { ProfileJobsService } from "../profile/profile-jobs.service";
+import { ListingsService } from "../lobby/listings.service";
+import { JoinService } from "../join/join.service";
+import { RealtimeFanoutService } from "../realtime/realtime-fanout.service";
 import { LinkRiotAccountDto } from "./dto/link-riot.dto";
+import { RiotAuthService } from "./riot-auth.service";
 
 @Injectable()
 export class RiotAccountsService {
@@ -22,12 +26,19 @@ export class RiotAccountsService {
     @InjectRepository(ProfileSnapshot) private readonly snapshots: Repository<ProfileSnapshot>,
     @InjectRepository(ChampionStat) private readonly champStats: Repository<ChampionStat>,
     @InjectRepository(MatchSeen) private readonly matchesSeen: Repository<MatchSeen>,
-    private readonly riot: RiotService,
-    private readonly profileJobs: ProfileJobsService
+    private readonly profileJobs: ProfileJobsService,
+    private readonly riotAuth: RiotAuthService,
+    @Inject(forwardRef(() => ListingsService))
+    private readonly listings: ListingsService,
+    @Inject(forwardRef(() => JoinService))
+    private readonly joins: JoinService,
+    @Inject(forwardRef(() => RealtimeFanoutService))
+    private readonly fanout: RealtimeFanoutService
   ) {}
 
   async link(userId: string, dto: LinkRiotAccountDto): Promise<RiotAccountDto> {
-    const platform = dto.platform.toLowerCase();
+    const chal = await this.riotAuth.takeVerifiedChallenge(dto.challengeId);
+    const platform = chal.platform.toLowerCase();
     if (BLOCKED_PLATFORMS.has(platform)) {
       throw new ForbiddenException({
         code: "REGION_NOT_SUPPORTED",
@@ -41,35 +52,7 @@ export class RiotAccountsService {
       });
     }
 
-    const region = this.riot.client.regionForPlatform(platform);
-
-    // The client can only report its LOCAL uuid, which Riot's Web API
-    // rejects ("Exception decrypting"). Resolve the real PUUID from the
-    // Riot ID instead — the LCU having reported this Riot ID at all is
-    // what proves ownership, since only the owner can be logged in.
-    let account;
-    try {
-      account = await this.riot.client.accountByRiotId(region, dto.gameName, dto.tagLine);
-    } catch (e) {
-      if (e instanceof RiotHttpError) {
-        if (e.status === 404) {
-          throw new NotFoundException({
-            code: "RIOT_ID_NOT_FOUND",
-            message: `Riot account ${dto.gameName}#${dto.tagLine} not found`,
-          });
-        }
-        // 401/403 (bad/missing API key), 429, or a Riot-side 5xx — none of
-        // these are the caller's fault, so surface a clean, retryable
-        // error instead of an opaque 500.
-        throw new ServiceUnavailableException({
-          code: "RIOT_API_UNAVAILABLE",
-          message: "Could not verify this account with Riot right now",
-        });
-      }
-      throw e;
-    }
-
-    const existing = await this.accounts.findOne({ where: { puuid: account.puuid } });
+    const existing = await this.accounts.findOne({ where: { puuid: chal.puuid } });
     if (existing && existing.userId !== userId) {
       throw new ConflictException({
         code: "PUUID_TAKEN",
@@ -80,8 +63,8 @@ export class RiotAccountsService {
     const now = new Date();
     let row: RiotAccount;
     if (existing) {
-      existing.riotId = account.gameName;
-      existing.tagLine = account.tagLine;
+      existing.riotId = chal.gameName;
+      existing.tagLine = chal.tagLine;
       existing.lcuPuuid = dto.lcuPuuid ?? existing.lcuPuuid;
       existing.summonerId =
         dto.summonerId != null ? String(dto.summonerId) : existing.summonerId;
@@ -93,10 +76,10 @@ export class RiotAccountsService {
       row = await this.accounts.save(
         this.accounts.create({
           userId,
-          puuid: account.puuid,
+          puuid: chal.puuid,
           lcuPuuid: dto.lcuPuuid ?? null,
-          riotId: account.gameName,
-          tagLine: account.tagLine,
+          riotId: chal.gameName,
+          tagLine: chal.tagLine,
           summonerId: dto.summonerId != null ? String(dto.summonerId) : null,
           platform,
           verifiedAt: now,
@@ -106,6 +89,7 @@ export class RiotAccountsService {
     }
 
     await this.profileJobs.enqueueRefresh(row.id, "interactive");
+    await this.fanout.joinAccountRooms(userId);
     return this.toDto(row);
   }
 
@@ -117,6 +101,9 @@ export class RiotAccountsService {
   async unlink(userId: string, id: string): Promise<{ ok: true }> {
     const row = await this.accounts.findOne({ where: { id, userId } });
     if (!row) throw new NotFoundException({ code: "NOT_FOUND" });
+
+    await this.listings.delistActiveForAccount(id);
+    await this.joins.cancelOutgoingForUser(userId);
 
     await this.champStats.delete({ riotAccountId: id });
     await this.matchesSeen.delete({ riotAccountId: id });

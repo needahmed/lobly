@@ -12,7 +12,7 @@ import {
   UnauthorizedException,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import { IsArray, IsIn, IsOptional, IsString, IsUUID } from "class-validator";
+import { IsArray, IsIn, IsInt, IsOptional, IsString, IsUUID, Min } from "class-validator";
 import { CurrentUser, type JwtPayload } from "../../common/decorators/current-user.decorator";
 import { Public } from "../../common/decorators/public.decorator";
 import { ReputationService } from "./reputation.service";
@@ -46,6 +46,11 @@ class EndorseDto {
   @IsArray()
   @IsIn(["GOOD_COMMS", "GOOD_TEAMMATE", "SKILLED"], { each: true })
   kinds!: ("GOOD_COMMS" | "GOOD_TEAMMATE" | "SKILLED")[];
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  gameId?: number;
 }
 
 class ResolveReportDto {
@@ -94,7 +99,7 @@ export class ReputationController {
     @Param("id", ParseUUIDPipe) id: string,
     @Body() body: EndorseDto
   ) {
-    return this.reputation.endorse(user.sub, id, body.toAccountId, body.kinds);
+    return this.reputation.endorse(user.sub, id, body.toAccountId, body.kinds, body.gameId);
   }
 
   @Public()

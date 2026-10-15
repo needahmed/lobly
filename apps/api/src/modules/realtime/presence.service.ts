@@ -31,6 +31,8 @@ export class PresenceService {
       listingStatus?: string;
       observedPuuid?: string;
       listingId?: string;
+      partyId?: string;
+      gameId?: number;
     }
   ): Promise<void> {
     const key = this.presenceKey(userId);

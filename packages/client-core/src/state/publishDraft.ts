@@ -210,7 +210,6 @@ export function draftToSlots(draft: PublishDraft): ListingSlot[] {
     id: newSlotId(),
     roles: r.filter((x) => ALL_ROLES.includes(x)),
     open: true,
-    pendingAccountId: null,
   }));
 }
 

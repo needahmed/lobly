@@ -1,10 +1,16 @@
-import { Injectable } from "@nestjs/common";
+import { Inject, Injectable, forwardRef } from "@nestjs/common";
 import { SocketEvents, type ListingStatePayload } from "@lobly/shared-types";
+import { RiotAccountsService } from "../identity/riot-accounts.service";
 import { SyncGateway } from "./sync.gateway";
 
 @Injectable()
 export class RealtimeFanoutService {
   private gateway: SyncGateway | null = null;
+
+  constructor(
+    @Inject(forwardRef(() => RiotAccountsService))
+    private readonly accounts: RiotAccountsService
+  ) {}
 
   bind(gateway: SyncGateway) {
     this.gateway = gateway;
@@ -63,6 +69,25 @@ export class RealtimeFanoutService {
       .fetchSockets();
     for (const s of sockets) {
       await s.join(this.sessionRoom(sessionId));
+    }
+  }
+
+  /**
+   * Join account and board rooms for every Riot account linked to this user.
+   * Covers accounts linked after the socket connected.
+   */
+  async joinAccountRooms(userId: string): Promise<void> {
+    if (!this.gateway?.server) return;
+    const sockets = await this.gateway.server
+      .in(this.userRoom(userId))
+      .fetchSockets();
+    if (!sockets.length) return;
+    const linked = await this.accounts.listMine(userId);
+    for (const socket of sockets) {
+      for (const account of linked) {
+        await socket.join(this.userRoomByAccount(account.id));
+        await socket.join(this.boardRoom(account.platform));
+      }
     }
   }
 

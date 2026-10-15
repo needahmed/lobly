@@ -267,6 +267,43 @@ export function RoleIcon({
   );
 }
 
+/** Filled roles solid, open roles faded. Non-positional queues show "3/5". */
+export function PartyStrip({
+  positional,
+  count,
+  max,
+  filled,
+  open,
+}: {
+  positional: boolean;
+  count: number;
+  max: number;
+  filled: string[];
+  open: string[];
+}) {
+  if (!positional) {
+    return (
+      <span style={{ color: c.text, fontSize: 12, fontWeight: 700 }}>
+        {count}/{max}
+      </span>
+    );
+  }
+  const openOnly = open.filter((role) => role && !filled.includes(role));
+  if (!filled.length && !openOnly.length) return null;
+  return (
+    <span style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
+      {filled.map((role) => (
+        <RoleIcon key={`filled-${role}`} role={role} size={14} color={c.text} />
+      ))}
+      {openOnly.map((role) => (
+        <span key={`open-${role}`} title={`${role} open`} style={{ opacity: 0.4 }}>
+          <RoleIcon role={role} size={14} />
+        </span>
+      ))}
+    </span>
+  );
+}
+
 export function RoleLabel({ role }: { role?: string | null }) {
   if (!role) return <span style={{ color: c.textFaint }}>—</span>;
   return (

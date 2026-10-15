@@ -37,6 +37,18 @@ contextBridge.exposeInMainWorld("loblyIpc", {
   getAuthToken: (force?: boolean): Promise<string | null> =>
     ipcRenderer.invoke(IPC.GET_AUTH_TOKEN, force),
 
+  onNavigate: (cb: (tab: string) => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, tab: string) => cb(tab);
+    ipcRenderer.on(IPC.NAVIGATE, handler);
+    return () => ipcRenderer.removeListener(IPC.NAVIGATE, handler);
+  },
+  setOpenAtLogin: (open: boolean) => ipcRenderer.send(IPC.SET_OPEN_AT_LOGIN, open),
+  riotSignIn: () => ipcRenderer.invoke(IPC.RIOT_SIGN_IN),
+  linkAnotherAccount: () => ipcRenderer.invoke(IPC.LINK_ACCOUNT),
+  devSignIn: (email: string, password: string) =>
+    ipcRenderer.invoke(IPC.DEV_SIGN_IN, email, password),
+  signOut: () => ipcRenderer.invoke(IPC.SIGN_OUT),
+
   windowControls: {
     minimize: () => ipcRenderer.send(IPC.WINDOW_MINIMIZE),
     maximize: () => ipcRenderer.send(IPC.WINDOW_MAXIMIZE),

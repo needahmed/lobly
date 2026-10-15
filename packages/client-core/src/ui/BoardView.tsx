@@ -5,12 +5,14 @@ import {
   eligibilityReasonText,
   formatSlotRoles,
   queueName,
+  slotAcceptsRole,
   type BoardRow,
   type BoardSort,
   type Role,
 } from "@lobly/shared-types";
-import { fetchBoard, requestJoin, type BoardQuery } from "../api/session";
+import { cancelJoin, fetchBoard, requestJoin, type BoardQuery } from "../api/session";
 import { getBridge } from "../shared/bridge";
+import { useAppStore } from "../shared/messaging";
 import { c, radius, font } from "./theme";
 import {
   Avatar,
@@ -19,15 +21,19 @@ import {
   EmptyState,
   LoadingBlock,
   RankBadge,
+  PartyStrip,
   RoleIcon,
   Tag,
 } from "./components";
 import { profileIcon, useStaticData } from "./useStaticData";
+import { PlayerMenu } from "./PlayerMenu";
 
 const HIDE_KEY = "lobly.board.hideIneligible";
 
 export function BoardView() {
   const sd = useStaticData();
+  const app = useAppStore();
+  const [rolePick, setRolePick] = useState<Record<string, Role>>({});
   const bridge = getBridge();
   const [rows, setRows] = useState<BoardRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -304,6 +310,17 @@ export function BoardView() {
                   </span>
                 )}
                 <span>{row.listing.slots.filter((s) => s.open).length} open</span>
+                {row.listing.party?.members && (
+                  <PartyStrip
+                    positional={Boolean(row.listing.queueMeta?.positional)}
+                    count={row.listing.party.members.length}
+                    max={row.listing.queueMeta?.maxLobbySize ?? 5}
+                    filled={row.listing.party.members
+                      .map((m) => m.roles[0])
+                      .filter((role): role is Role => role != null)}
+                    open={row.listing.slots.filter((s) => s.open).flatMap((s) => s.roles)}
+                  />
+                )}
                 <span>
                   {row.reliability != null ? `${row.reliability} rel` : "New player"}
                 </span>
@@ -329,27 +346,42 @@ export function BoardView() {
             {row.isOwn ? (
               <Button
                 onClick={() => {
-                  // Navigate hint — App uses tabs via bridge; toast for now
-                  getBridge()?.setToast("Edit this lobby from My Lobby");
+                  const b = getBridge();
+                  if (b?.navigate) b.navigate("listing");
+                  else b?.store.update({ uiTab: "listing" });
                 }}
               >
                 Edit / Unpublish
               </Button>
-            ) : (
+            ) : row.myRequest &&
+              (row.myRequest.status === "PENDING" || row.myRequest.status === "ACCEPTED") ? (
               <Button
-                variant="primary"
-                disabled={busy === row.listing.id || !row.eligible}
-                title={
-                  !row.eligible
-                    ? row.reasons.map(eligibilityReasonText).join(", ")
-                    : undefined
-                }
+                disabled={busy === row.listing.id}
                 onClick={async () => {
                   setBusy(row.listing.id);
                   try {
-                    const joinRole =
-                      (open?.roles?.[0] as Role | undefined) ??
-                      (role as Role | undefined);
+                    await cancelJoin(row.myRequest!.id);
+                    getBridge()?.setToast("Request cancelled");
+                  } catch (e: any) {
+                    getBridge()?.setToast(e?.body?.message ?? e?.message ?? "Couldn't cancel");
+                  } finally {
+                    setBusy(null);
+                  }
+                }}
+              >
+                Requested · Cancel
+              </Button>
+            ) : (
+              <JoinButton
+                row={row}
+                busy={busy === row.listing.id}
+                choices={joinRoleChoices(row, app.profileHints?.primaryRole, app.profileHints?.secondaryRole)}
+                picked={rolePick[row.listing.id]}
+                onPick={(role) => setRolePick((cur) => ({ ...cur, [row.listing.id]: role }))}
+                openLabel={openLabel}
+                onJoin={async (joinRole) => {
+                  setBusy(row.listing.id);
+                  try {
                     const r = await requestJoin(row.listing.id, joinRole);
                     getBridge()?.setToast(`Request sent · match score ${r.matchScore}`);
                   } catch (e: any) {
@@ -363,15 +395,13 @@ export function BoardView() {
                     setBusy(null);
                   }
                 }}
-              >
-                {busy === row.listing.id
-                  ? "Sending…"
-                  : !row.eligible
-                    ? "Can't join"
-                    : open
-                      ? `Join ${openLabel}`
-                      : "Join"}
-              </Button>
+              />
+            )}
+            {!row.isOwn && (
+              <PlayerMenu
+                accountId={row.listing.creatorAccountId}
+                listingId={row.listing.id}
+              />
             )}
           </Card>
         );
@@ -388,6 +418,73 @@ const filterStyle: CSSProperties = {
   padding: "8px 11px",
   fontSize: 12,
 };
+
+function joinRoleChoices(
+  row: BoardRow,
+  primary?: string | null,
+  secondary?: string | null
+): Role[] {
+  const open = row.listing.slots.filter((s) => s.open);
+  if (!open.length) return [];
+  if (open.every((s) => !s.roles || s.roles.length === 0)) return [];
+  const prefs = [primary, secondary].filter(
+    (r): r is Role => !!r && (ALL_ROLES as readonly string[]).includes(r)
+  );
+  const accepted: Role[] = [];
+  for (const role of prefs) {
+    if (open.some((s) => slotAcceptsRole(s.roles, role)) && !accepted.includes(role)) {
+      accepted.push(role);
+    }
+  }
+  if (accepted.length) return accepted;
+  const fallback = open.find((s) => s.roles.length > 0)?.roles[0];
+  return fallback ? [fallback] : [];
+}
+
+function JoinButton({
+  row,
+  busy,
+  choices,
+  picked,
+  onPick,
+  openLabel,
+  onJoin,
+}: {
+  row: BoardRow;
+  busy: boolean;
+  choices: Role[];
+  picked?: Role;
+  onPick: (role: Role) => void;
+  openLabel: string;
+  onJoin: (role?: string) => void;
+}) {
+  const role = choices.length > 1 ? (picked ?? choices[0]) : choices[0];
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "stretch" }}>
+      {choices.length > 1 && (
+        <select
+          value={role}
+          onChange={(e) => onPick(e.target.value as Role)}
+          style={{ ...filterStyle, padding: "4px 8px" }}
+        >
+          {choices.map((r) => (
+            <option key={r} value={r}>
+              {r}
+            </option>
+          ))}
+        </select>
+      )}
+      <Button
+        variant="primary"
+        disabled={busy || !row.eligible}
+        title={!row.eligible ? row.reasons.map(eligibilityReasonText).join(", ") : undefined}
+        onClick={() => onJoin(role)}
+      >
+        {busy ? "Sending…" : !row.eligible ? "Can't join" : choices.length ? `Join ${role}` : `Join ${openLabel}`}
+      </Button>
+    </div>
+  );
+}
 
 function expiryLabel(iso: string): string | null {
   const ms = Date.parse(iso) - Date.now();

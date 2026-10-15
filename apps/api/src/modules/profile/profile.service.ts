@@ -10,8 +10,10 @@ import type {
 } from "@lobly/shared-types";
 import {
   ChampionStat,
+  JoinRequest,
   ProfileSnapshot,
   RiotAccount,
+  Session,
   UserPrefs,
 } from "../../database/entities";
 import { ProfileJobsService, type RefreshPriority } from "./profile-jobs.service";
@@ -50,6 +52,8 @@ export class ProfileService {
     @InjectRepository(ProfileSnapshot) private readonly snapshots: Repository<ProfileSnapshot>,
     @InjectRepository(ChampionStat) private readonly champStats: Repository<ChampionStat>,
     @InjectRepository(UserPrefs) private readonly prefs: Repository<UserPrefs>,
+    @InjectRepository(Session) private readonly sessions: Repository<Session>,
+    @InjectRepository(JoinRequest) private readonly joinRequests: Repository<JoinRequest>,
     private readonly jobs: ProfileJobsService,
     private readonly champions: ChampionsService,
     @Optional()
@@ -62,6 +66,10 @@ export class ProfileService {
     moment: FreshnessMoment
   ): Promise<ProfileSnapshot | null> {
     const snap = await this.snapshots.findOne({ where: { riotAccountId: accountId } });
+    // game_ended freshness is owned by the postgame job (delayed match-v5),
+    // not an interactive enqueue from session end.
+    if (moment === "game_ended") return snap;
+
     const maxAge = FRESHNESS_MS[moment];
     const priority: RefreshPriority =
       moment === "publishing" || moment === "join_request"
@@ -100,7 +108,7 @@ export class ProfileService {
     return snap;
   }
 
-  async getCard(riotAccountId: string): Promise<ProfileCard> {
+  async getCard(riotAccountId: string, viewerUserId?: string): Promise<ProfileCard> {
     const account = await this.accounts.findOne({ where: { id: riotAccountId } });
     if (!account) throw new NotFoundException({ code: "NOT_FOUND" });
 
@@ -142,7 +150,7 @@ export class ProfileService {
           iconUrl: meta?.iconUrl,
         };
       }),
-      prefs: prefs ? this.toPrefsDto(prefs) : null,
+      prefs: await this.visiblePrefs(account.userId, prefs, viewerUserId),
       reputation,
     };
   }
@@ -156,7 +164,7 @@ export class ProfileService {
       where: { userId },
       order: { lastSeenAt: "DESC", verifiedAt: "DESC" },
     });
-    return Promise.all(accounts.map((a) => this.getCard(a.id)));
+    return Promise.all(accounts.map((a) => this.getCard(a.id, userId)));
   }
 
   async updatePrefs(userId: string, body: UpdatePrefsBody): Promise<UserPrefsDto> {
@@ -188,6 +196,79 @@ export class ProfileService {
   async getPrefs(userId: string): Promise<UserPrefsDto | null> {
     const row = await this.prefs.findOne({ where: { userId } });
     return row ? this.toPrefsDto(row) : null;
+  }
+
+  /**
+   * Discord tag is owner-only, PUBLIC, or ACCEPTED when the viewer shares a
+   * session or an ACCEPTED/COMPLETED join with the owner. autoAccept is
+   * never returned to anyone else. Omitted viewer is treated as a stranger.
+   */
+  private async visiblePrefs(
+    ownerUserId: string,
+    prefs: UserPrefs | null,
+    viewerUserId?: string
+  ): Promise<UserPrefsDto | null> {
+    if (!prefs) return null;
+    const dto = this.toPrefsDto(prefs);
+    if (viewerUserId && viewerUserId === ownerUserId) return dto;
+
+    let showTag = prefs.discordReveal === "PUBLIC";
+    if (!showTag && prefs.discordReveal === "ACCEPTED" && viewerUserId) {
+      showTag = await this.sharesLobbyContext(viewerUserId, ownerUserId);
+    }
+    return {
+      ...dto,
+      discordTag: showTag ? dto.discordTag : null,
+      autoAcceptLoblyInvites: false,
+    };
+  }
+
+  private async sharesLobbyContext(
+    viewerUserId: string,
+    ownerUserId: string
+  ): Promise<boolean> {
+    const [viewerAccounts, ownerAccounts] = await Promise.all([
+      this.accounts.find({ where: { userId: viewerUserId } }),
+      this.accounts.find({ where: { userId: ownerUserId } }),
+    ]);
+    const viewerIds = viewerAccounts.map((a) => a.id);
+    const ownerIds = ownerAccounts.map((a) => a.id);
+    if (!viewerIds.length || !ownerIds.length) return false;
+
+    const sharedSession = await this.sessions
+      .createQueryBuilder("s")
+      .where(
+        `EXISTS (
+          SELECT 1 FROM unnest(s.member_account_ids) AS member(id)
+          WHERE member.id IN (:...viewerIds)
+        )`,
+        { viewerIds }
+      )
+      .andWhere(
+        `EXISTS (
+          SELECT 1 FROM unnest(s.member_account_ids) AS member(id)
+          WHERE member.id IN (:...ownerIds)
+        )`,
+        { ownerIds }
+      )
+      .getExists();
+    if (sharedSession) return true;
+
+    return this.joinRequests
+      .createQueryBuilder("jr")
+      .innerJoin("jr.listing", "l")
+      .where("jr.status IN (:...statuses)", {
+        statuses: ["ACCEPTED", "COMPLETED"],
+      })
+      .andWhere(
+        `(
+          (jr.requester_account_id IN (:...viewerIds) AND l.creator_account_id IN (:...ownerIds))
+          OR
+          (jr.requester_account_id IN (:...ownerIds) AND l.creator_account_id IN (:...viewerIds))
+        )`,
+        { viewerIds, ownerIds }
+      )
+      .getExists();
   }
 
   async getSnapshotEntity(accountId: string): Promise<ProfileSnapshot | null> {

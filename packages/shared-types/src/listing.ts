@@ -26,7 +26,11 @@ export type GameflowPhase =
   | "InProgress"
   | "WaitingForStats"
   | "PreEndOfGame"
-  | "EndOfGame";
+  | "EndOfGame"
+  | "TerminatedInError"
+  | "Reconnect"
+  | "WatchInProgress"
+  | "CheckedIntoTournament";
 
 export interface Listing {
   id?: string;

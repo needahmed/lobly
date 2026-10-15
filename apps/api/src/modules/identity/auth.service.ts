@@ -43,7 +43,10 @@ export class AuthService {
   async login(email: string, password: string): Promise<AuthTokens> {
     const normalized = email.trim().toLowerCase();
     const user = await this.users.findOne({ where: { email: normalized } });
-    if (!user) throw new UnauthorizedException({ code: "INVALID_CREDENTIALS" });
+    // Riot-only users have a null password hash. Never pass that to bcrypt.
+    if (!user || user.passwordHash == null) {
+      throw new UnauthorizedException({ code: "INVALID_CREDENTIALS" });
+    }
 
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) throw new UnauthorizedException({ code: "INVALID_CREDENTIALS" });
@@ -82,7 +85,8 @@ export class AuthService {
     return { ok: true };
   }
 
-  private async issueTokens(user: User): Promise<AuthTokens> {
+  /** Package-visible so Riot verify can mint a session without a password. */
+  async issueTokens(user: User): Promise<AuthTokens> {
     const accessToken = await this.jwt.signAsync(
       { sub: user.id },
       {

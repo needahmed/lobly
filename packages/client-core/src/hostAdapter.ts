@@ -11,10 +11,19 @@ export interface LcuTransport {
   ): Promise<T>;
 }
 
+/**
+ * Push events a host may deliver. "phase" and "lobby" are required;
+ * "gameflowSession" (/lol-gameflow/v1/session) and "champSelect"
+ * (/lol-champ-select/v1/session) are optional richer feeds — a host without
+ * them still works, the tracker just learns less (no gameId, no champ-select
+ * roles) until refreshLcuState() reads them over REST.
+ */
+export type LcuBusEvent = "phase" | "lobby" | "gameflowSession" | "champSelect";
+
 export interface CoreEventBus {
   start(): void;
   stop(): void;
-  on(evt: "phase" | "lobby", handler: (data: unknown) => void): void;
+  on(evt: LcuBusEvent, handler: (data: unknown) => void): void;
   /** Optional: pull-based hosts (GEP "something changed" signals) use this to
    *  trigger a fresh LCU lobby read. Push-based hosts (Electron's own
    *  poller/WS) can leave it unimplemented. */
@@ -28,6 +37,23 @@ export interface HostAdapter {
   /** Best-effort: is the main UI window hidden/minimized right now? Used to
    *  decide whether an incoming chat message also needs a toast. */
   isDesktopHidden(): Promise<boolean>;
+  /** Dev email login is compiled in only when the host's flag is on. */
+  isDevAuthEnabled?: () => boolean;
+  /**
+   * Show the main window without stealing focus. Electron uses
+   * showInactive(); Overwolf shows the window behind the League client.
+   * The decision to call this lives in client-core (once per game, setting on).
+   */
+  showWindowInactive?: () => void;
+  /** Desktop notification. Hosts no-op when the window is focused, except
+   *  where the caller already decided (chat). */
+  notify?: (
+    title: string,
+    body: string,
+    opts?: { actions?: { id: string; label: string }[]; tab?: string }
+  ) => void;
+  /** Electron "Start with Windows". Absent on hosts that cannot set it. */
+  setOpenAtLogin?: (open: boolean) => void;
 }
 
 let adapter: HostAdapter | null = null;

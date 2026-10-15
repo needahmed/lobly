@@ -20,6 +20,12 @@ interface LoblyIpc {
   backendUrl: () => string;
   getAuthToken: (force?: boolean) => Promise<string | null>;
   windowControls: NonNullable<LoblyBridge["windowControls"]>;
+  onNavigate: (cb: (tab: string) => void) => () => void;
+  setOpenAtLogin: (open: boolean) => void;
+  riotSignIn: () => Promise<void>;
+  linkAnotherAccount: () => Promise<void>;
+  devSignIn: (email: string, password: string) => Promise<void>;
+  signOut: () => Promise<void>;
 }
 
 export function getIpc(): LoblyIpc {
@@ -62,6 +68,13 @@ export function installBridge(): void {
     sendChat: (sessionId, body) => ipc.sendChat(sessionId, body),
     acceptJoin: (id) => ipc.acceptJoin(id),
     declineJoin: (id) => ipc.declineJoin(id),
+    navigate: (tab) => appStore.update({ uiTab: tab }),
+    onNavigate: (cb) => ipc.onNavigate(cb),
+    riotSignIn: () => ipc.riotSignIn(),
+    linkAnotherAccount: () => ipc.linkAnotherAccount(),
+    devSignIn: (email, password) => ipc.devSignIn(email, password),
+    signOut: () => ipc.signOut(),
+    setOpenAtLogin: (open) => ipc.setOpenAtLogin(open),
     windowControls: ipc.windowControls,
     // No LCU Lab spike panel on the Electron host — C13's browser-WebSocket
     // constraint doesn't apply here, so there's nothing to spike.

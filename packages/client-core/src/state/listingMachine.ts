@@ -5,11 +5,14 @@ import {
   isPublishableQueue,
   type GameflowPhase,
   type LobbyCapability,
+  type PartyState,
 } from "@lobly/shared-types";
 import { appStore } from "./store";
 import { syncAgent } from "../sync/syncAgent";
 import { getHostAdapter } from "../hostAdapter";
 import { getBridge } from "../shared/bridge";
+import { gameFlowTracker } from "../lcu/gameFlowTracker";
+import { isLobbyShaped } from "../lcu/partyReducer";
 import {
   defaultDraft,
   draftToCreateBody,
@@ -29,6 +32,9 @@ export type MachineEvent =
   | { type: "SLOT_REOPENED" }
   | { type: "EXPIRED" }
   | { type: "QUEUE_AGAIN" };
+
+/** Final SESSION_END (Lobby/None) is sent once per session. */
+let finalSessionEndSent = false;
 
 function status(): ListingStatus {
   return appStore.state.listing.status;
@@ -90,7 +96,7 @@ async function publishViaApi(): Promise<string | undefined> {
 
     const body = draftToCreateBody(draft, cap, accountId);
     const listing = await createListing(body);
-    appStore.update({ myListing: listing, publishReason: null });
+    appStore.update({ myListing: listing, publishReason: null, queueDrift: false });
     return listing.id;
   } catch (e: any) {
     const msg = e?.body?.message ?? e?.message ?? "Publish failed";
@@ -264,6 +270,7 @@ export function dispatchMachine(event: MachineEvent) {
         event.type === "PHASE" &&
         (event.phase === "Matchmaking" || event.phase === "ChampSelect")
       ) {
+        finalSessionEndSent = false;
         setStatus(ListingStatus.IN_SESSION);
         sync(SocketEvents.SESSION_START);
       }
@@ -286,15 +293,32 @@ export function dispatchMachine(event: MachineEvent) {
         (event.phase === "EndOfGame" || event.phase === "Lobby" || event.phase === "None")
       ) {
         setStatus(ListingStatus.POST_SESSION);
-        sync(SocketEvents.SESSION_END);
+        sync(SocketEvents.SESSION_END, {
+          listingId: appStore.state.listing.id,
+          observedPhase: event.phase,
+          final: event.phase === "Lobby" || event.phase === "None",
+        });
       }
       break;
     }
     case ListingStatus.POST_SESSION: {
-      if (event.type === "QUEUE_AGAIN") {
+      if (
+        event.type === "PHASE" &&
+        (event.phase === "Lobby" || event.phase === "None") &&
+        !finalSessionEndSent
+      ) {
+        finalSessionEndSent = true;
+        sync(SocketEvents.SESSION_END, {
+          listingId: appStore.state.listing.id,
+          observedPhase: event.phase,
+          final: true,
+        });
+      } else if (event.type === "QUEUE_AGAIN") {
+        finalSessionEndSent = false;
         setStatus(ListingStatus.LISTED);
         sync(SocketEvents.LISTING_RELIST);
       } else if (event.type === "EXPIRED") {
+        finalSessionEndSent = false;
         setStatus(ListingStatus.DELISTED);
         sync(SocketEvents.LISTING_DELIST);
         appStore.update({ myListing: null });
@@ -306,61 +330,91 @@ export function dispatchMachine(event: MachineEvent) {
   }
 }
 
+/**
+ * Entry point for a bare gameflow phase from any source (GEP game_flow, the
+ * /gameflow-phase WS event, REST seeding). Routed through the tracker so that
+ * repeats from several channels reach the listing machine once per change.
+ */
 export function onGameflowPhase(phase: GameflowPhase) {
+  void gameFlowTracker.ingest("phase", phase);
+}
+
+/** Applies a phase change the tracker has already de-duplicated. */
+function applyGameflowPhase(phase: GameflowPhase) {
   const prev = appStore.state.gameflowPhase;
   if (prev !== phase) {
     appStore.update({ gameflowPhase: phase });
     appStore.logLine(`gameflow: ${prev} → ${phase}`);
   }
   dispatchMachine({ type: "PHASE", phase });
-
-  if (phase === "EndOfGame" || phase === "WaitingForStats") {
-    appStore.update({ sessionEndPending: true });
-  }
 }
 
 export async function onLobbyChanged() {
   await getHostAdapter().eventBus.notifyLobbySignal?.();
 }
 
-function isLobbyShaped(v: unknown): boolean {
-  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
-  const l = v as any;
-  return l.gameConfig != null || l.queueId != null || l.partyId != null;
+let partyReconcileTimer: ReturnType<typeof setTimeout> | null = null;
+
+function schedulePartyReconcile() {
+  if (appStore.state.flags?.partySync === false) return;
+  const s = status();
+  if (
+    s !== ListingStatus.LISTED &&
+    s !== ListingStatus.FILLING &&
+    s !== ListingStatus.PAUSED
+  ) {
+    return;
+  }
+  if (partyReconcileTimer) clearTimeout(partyReconcileTimer);
+  partyReconcileTimer = setTimeout(() => {
+    partyReconcileTimer = null;
+    const party = appStore.state.party;
+    if (party) void reconcilePartyNow(party);
+  }, 1500);
 }
 
-let lastReconcileAt = 0;
-let lastFreeSeats: number | null = null;
-
-async function maybeReconcileSlots(cap: LobbyCapability) {
+async function reconcilePartyNow(party: PartyState) {
   const listingId = appStore.state.listing.id;
   const s = status();
   if (
     !listingId ||
+    party.queueId == null ||
     (s !== ListingStatus.LISTED &&
       s !== ListingStatus.FILLING &&
       s !== ListingStatus.PAUSED)
   ) {
     return;
   }
-  if (lastFreeSeats === cap.freeSeats) return;
-  const now = Date.now();
-  if (now - lastReconcileAt < 1500) return;
-  lastReconcileAt = now;
-  lastFreeSeats = cap.freeSeats;
-
   try {
-    const { reconcileListingSlots } = await import("../api/session");
-    const summary = await reconcileListingSlots(listingId, cap.freeSeats);
+    const { reconcileListingParty } = await import("../api/session");
+    const beforeQueue = appStore.state.myListing?.queueId;
+    const summary = await reconcileListingParty(listingId, {
+      partyId: party.partyId,
+      queueId: party.queueId,
+      members: party.members.map((m) => ({
+        puuid: m.puuid,
+        summonerId: m.summonerId,
+        roles: m.roles,
+        isLeader: m.isLeader,
+      })),
+      filledRoles: party.filledRoles,
+      phase: party.phase,
+    });
+    const drifted =
+      summary.status === ListingStatus.DELISTED &&
+      beforeQueue != null &&
+      party.queueId !== beforeQueue;
     appStore.update({
       myListing: summary,
+      queueDrift: drifted || appStore.state.queueDrift,
       listing: { status: summary.status as ListingStatus, id: summary.id },
     });
-    if (summary.status === ListingStatus.PAUSED && cap.freeSeats === 0) {
+    if (summary.status === ListingStatus.PAUSED) {
       appStore.logLine("listing paused — lobby full");
     }
+    if (drifted) appStore.logLine("listing delisted — queue changed");
   } catch (e: any) {
-    appStore.logLine(`reconcile slots: ${e?.message ?? e}`);
+    appStore.logLine(`reconcile party: ${e?.message ?? e}`);
   }
 }
 
@@ -379,7 +433,6 @@ export function applyLobby(lobby: unknown) {
       publishDraft: null,
     });
     if (prev != null) appStore.logLine("lobby closed");
-    lastFreeSeats = null;
     const s = status();
     if (
       s === ListingStatus.LISTED ||
@@ -417,8 +470,6 @@ export function applyLobby(lobby: unknown) {
     publishDraft: nextDraft,
   });
 
-  if (cap) void maybeReconcileSlots(cap);
-
   const q = cap?.queueId ?? null;
   if (prevCap?.queueId !== q) {
     appStore.logLine(
@@ -430,30 +481,93 @@ export function applyLobby(lobby: unknown) {
   }
 }
 
-export function wireListingMachineToBus() {
-  const bus = getHostAdapter().eventBus;
-  bus.on("lobby", applyLobby);
-  bus.on("phase", (phase) => {
-    if (typeof phase === "string") onGameflowPhase(phase as GameflowPhase);
+let trackerWired = false;
+
+function wireTracker() {
+  if (trackerWired) return;
+  trackerWired = true;
+  gameFlowTracker.configure({
+    fetch: (endpoint) => getHostAdapter().lcuTransport.request<unknown>(endpoint),
+    log: (line) => appStore.logLine(line),
   });
+  gameFlowTracker.onPhase((edge) => {
+    if (!edge.legal) {
+      appStore.logLine(`gameflow edge ${edge.from} → ${edge.to} outside transition table`);
+    }
+    applyGameflowPhase(edge.to);
+  });
+  gameFlowTracker.onParty((party) => {
+    appStore.update({ party });
+    schedulePartyReconcile();
+  });
+  gameFlowTracker.onGameStarted((ctx) => appStore.update({ gameContext: ctx }));
+
+  // LCU gone → forget tracked state so the reconnect replays every phase.
+  let wasConnected = appStore.state.lcu.connected;
+  appStore.subscribe(() => {
+    const connected = appStore.state.lcu.connected;
+    if (wasConnected && !connected) void gameFlowTracker.reset();
+    wasConnected = connected;
+  });
+}
+
+export function wireListingMachineToBus() {
+  wireTracker();
+  const bus = getHostAdapter().eventBus;
+  bus.on("lobby", (lobby) => {
+    applyLobby(lobby);
+    void gameFlowTracker.ingest("lobby", lobby);
+  });
+  bus.on("phase", (phase) => void gameFlowTracker.ingest("phase", phase));
+  bus.on("gameflowSession", (s) => void gameFlowTracker.ingest("gameflowSession", s));
+  bus.on("champSelect", (cs) => void gameFlowTracker.ingest("champSelect", cs));
   bus.start();
 }
 
+/**
+ * Re-read everything the push channels would otherwise only report as
+ * changes: on (re)connect, the user may already be in a lobby or a game.
+ * The gameflow session is the source of truth for phase, queue and gameId;
+ * the bare phase endpoint is only the fallback when it can't be read.
+ */
 export async function refreshLcuState(): Promise<void> {
+  wireTracker();
   const transport = getHostAdapter().lcuTransport;
 
+  let sessionRead = false;
   try {
-    const phase = await transport.request<string | null>("gameflowPhase");
-    if (typeof phase === "string" && phase) {
-      onGameflowPhase(phase as GameflowPhase);
-    }
+    const session = await transport.request<unknown>("gameflowSession");
+    await gameFlowTracker.ingest("gameflowSession", session);
+    sessionRead = true;
   } catch (e: any) {
-    appStore.logLine(`phase read failed: ${e?.message ?? e}`);
+    appStore.logLine(`gameflow session read failed: ${e?.message ?? e}`);
+  }
+
+  if (!sessionRead) {
+    try {
+      const phase = await transport.request<string | null>("gameflowPhase");
+      if (typeof phase === "string" && phase) {
+        await gameFlowTracker.ingest("phase", phase);
+      }
+    } catch (e: any) {
+      appStore.logLine(`phase read failed: ${e?.message ?? e}`);
+    }
   }
 
   try {
-    applyLobby(await transport.request<unknown>("lobby"));
+    const lobby = await transport.request<unknown>("lobby");
+    applyLobby(lobby);
+    await gameFlowTracker.ingest("lobby", lobby);
   } catch (e: any) {
     appStore.logLine(`lobby read failed: ${e?.message ?? e}`);
+  }
+
+  if (gameFlowTracker.getState().phase === "ChampSelect") {
+    try {
+      const cs = await transport.request<unknown>("champSelectSession");
+      await gameFlowTracker.ingest("champSelect", cs);
+    } catch (e: any) {
+      appStore.logLine(`champ select read failed: ${e?.message ?? e}`);
+    }
   }
 }

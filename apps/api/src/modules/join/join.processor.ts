@@ -11,6 +11,8 @@ export class JoinProcessor extends WorkerHost {
   async process(job: Job<{ joinRequestId: string }>): Promise<void> {
     if (job.name === "timeout") {
       await this.joins.handleTimeout(job.data.joinRequestId);
+    } else if (job.name === "pending-timeout") {
+      await this.joins.handlePendingTimeout(job.data.joinRequestId);
     }
   }
 }

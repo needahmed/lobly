@@ -15,8 +15,12 @@ export class Session {
   @PrimaryGeneratedColumn("uuid")
   id!: string;
 
-  @Column({ name: "listing_id", type: "uuid" })
-  listingId!: string;
+  @Column({ name: "listing_id", type: "uuid", nullable: true })
+  listingId!: string | null;
+
+  /** LISTING for matchmade sessions. ORGANIC stays unused while the flag is off. */
+  @Column({ type: "text", default: "LISTING" })
+  source!: string;
 
   @ManyToOne(() => Listing, { onDelete: "CASCADE" })
   @JoinColumn({ name: "listing_id" })
@@ -33,6 +37,10 @@ export class Session {
 
   @Column({ name: "games_played", type: "int", default: 0 })
   gamesPlayed!: number;
+
+  /** Riot-confirmed game ids. Also the idempotency set for gamesPlayed. */
+  @Column({ name: "riot_verified_game_ids", type: "bigint", array: true, default: "{}" })
+  riotVerifiedGameIds!: string[];
 
   @Column({ name: "ended_at", type: "timestamptz", nullable: true })
   endedAt!: Date | null;

@@ -159,9 +159,9 @@ export function evaluateEligibility(
     }
   }
 
-  // 5. Languages
-  if (listing.languages?.length) {
-    const prefsLangs = requesterPrefs?.languages ?? [];
+  // 5. Languages. An empty or missing requester list is "no preference".
+  const prefsLangs = requesterPrefs?.languages ?? [];
+  if (listing.languages?.length && prefsLangs.length > 0) {
     const overlap = listing.languages.some((l) =>
       prefsLangs.map((x) => x.toLowerCase()).includes(l.toLowerCase())
     );

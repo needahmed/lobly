@@ -6,6 +6,11 @@ import { SessionService } from "./session.service";
 export class SessionController {
   constructor(private readonly sessions: SessionService) {}
 
+  @Get("active")
+  active(@CurrentUser() user: JwtPayload) {
+    return this.sessions.findActiveSummaryForUser(user.sub);
+  }
+
   @Get(":id")
   get(
     @CurrentUser() user: JwtPayload,

@@ -47,4 +47,8 @@ export class JoinRequest {
 
   @Column({ name: "decided_at", type: "timestamptz", nullable: true })
   decidedAt!: Date | null;
+
+  /** Set when the creator's client reports the League invite was actually sent. */
+  @Column({ name: "invite_sent_at", type: "timestamptz", nullable: true })
+  inviteSentAt!: Date | null;
 }

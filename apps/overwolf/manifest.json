@@ -13,7 +13,7 @@
     "window_icon": "icons/window_icon.png",
     "dock_button_title": "LOBLY"
   },
-  "permissions": ["GameInfo", "Hotkeys", "FileSystem"],
+  "permissions": ["GameInfo", "Hotkeys", "FileSystem", "Web"],
   "data": {
     "start_window": "background",
     "windows": {

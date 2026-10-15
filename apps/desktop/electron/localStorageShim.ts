@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { app } from "electron";
+import { app, safeStorage } from "electron";
 
 /**
  * client-core's auth persistence (packages/client-core/src/api/client.ts)
@@ -31,11 +31,12 @@ class FileLocalStorage {
   }
 
   getItem(key: string): string | null {
-    return Object.prototype.hasOwnProperty.call(this.data, key) ? this.data[key] : null;
+    if (!Object.prototype.hasOwnProperty.call(this.data, key)) return null;
+    return decodeStored(this.data[key]);
   }
 
   setItem(key: string, value: string) {
-    this.data[key] = value;
+    this.data[key] = encodeStored(value);
     this.persist();
   }
 
@@ -52,4 +53,28 @@ class FileLocalStorage {
 
 export function installLocalStorageShim() {
   (globalThis as any).localStorage = new FileLocalStorage();
+}
+
+function encryptionAvailable(): boolean {
+  try {
+    return safeStorage.isEncryptionAvailable();
+  } catch {
+    return false;
+  }
+}
+
+function encodeStored(value: string): string {
+  if (!encryptionAvailable()) return value;
+  const enc = safeStorage.encryptString(value);
+  return `enc:${enc.toString("base64")}`;
+}
+
+function decodeStored(raw: string): string {
+  if (!raw.startsWith("enc:")) return raw;
+  if (!encryptionAvailable()) return raw;
+  try {
+    return safeStorage.decryptString(Buffer.from(raw.slice(4), "base64"));
+  } catch {
+    return raw;
+  }
 }

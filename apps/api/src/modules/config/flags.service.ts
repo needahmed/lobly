@@ -19,6 +19,10 @@ export class FlagsService {
       autoAccept: this.config.get<string>("FLAG_AUTO_ACCEPT") !== "false",
       board: this.config.get<string>("FLAG_BOARD") !== "false",
       allowedPlatforms: platforms,
+      partySync: this.config.get<string>("FLAG_PARTY_SYNC") !== "false",
+      postgameLoop: this.config.get<string>("FLAG_POSTGAME_LOOP") !== "false",
+      organicEndorse: this.config.get<string>("FLAG_ORGANIC_ENDORSE") === "true",
+      clientLobbyWatch: this.config.get<string>("FLAG_CLIENT_LOBBY_WATCH") !== "false",
     };
   }
 }

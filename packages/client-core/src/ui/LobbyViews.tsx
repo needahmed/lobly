@@ -1,14 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ListingStatus,
   displayQueueLabel,
 } from "@lobly/shared-types";
 import {
-  acceptJoin,
-  declineJoin,
+  cancelJoin,
+  decideJoin,
   endorse,
   fetchListingRequests,
   patchListing,
+  reportInviteResult,
 } from "../api/session";
 import { getBridge, type LoblyBridge } from "../shared/bridge";
 import type { AppState } from "../state/store";
@@ -23,6 +24,7 @@ import {
   Button,
   Card,
   EmptyState,
+  PartyStrip,
   RankBadge,
   RoleIcon,
   SectionTitle,
@@ -31,6 +33,7 @@ import {
 } from "./components";
 import { championIcon, useStaticData } from "./useStaticData";
 import { PublishForm } from "./PublishForm";
+import { PlayerMenu } from "./PlayerMenu";
 
 /* ------------------------------------------------------------- My Lobby */
 
@@ -53,6 +56,8 @@ export function ListingView({
     status === ListingStatus.PAUSED;
   const [editing, setEditing] = useState(false);
   const draft = state.publishDraft;
+
+  const party = state.party;
 
   const expiresLabel = useMemo(() => {
     const exp = state.myListing?.expiresAt;
@@ -99,6 +104,18 @@ export function ListingView({
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {state.queueDrift && (
+        <Card pad={16}>
+          <SectionTitle>Queue changed</SectionTitle>
+          <div style={{ color: c.textDim, fontSize: 13, marginBottom: 12 }}>
+            Your League lobby moved to a different queue, so this listing was taken down.
+            Republish it for the lobby you have open now.
+          </div>
+          <Button variant="primary" onClick={() => bridge?.dispatch({ type: "PUBLISH" })}>
+            Republish for this queue
+          </Button>
+        </Card>
+      )}
       <Card
         pad={20}
         style={{
@@ -122,7 +139,7 @@ export function ListingView({
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "repeat(4, minmax(130px, 1fr))",
+              gridTemplateColumns: "repeat(5, minmax(110px, 1fr))",
               gap: 14,
             }}
           >
@@ -140,6 +157,22 @@ export function ListingView({
               label="Fill style"
               value={cap.positional ? "Roles" : "Open"}
               sub={cap.isCustom ? "Custom" : cap.gameMode ?? "—"}
+            />
+            <StatBlock
+              label="Party"
+              value={
+                party ? (
+                  <PartyStrip
+                    positional={party.positional}
+                    count={party.members.length}
+                    max={party.maxLobbySize ?? cap.maxLobbySize}
+                    filled={party.filledRoles}
+                    open={party.openRoles}
+                  />
+                ) : (
+                  "—"
+                )
+              }
             />
             <StatBlock label="Phase" value={state.gameflowPhase} />
           </div>
@@ -272,6 +305,21 @@ export function ListingView({
             >
               Copy
             </Button>
+            {state.flags?.inviteAutomation === false && (
+              <Button
+                variant="primary"
+                onClick={() => {
+                  const id = state.manualInvite!.joinRequestId;
+                  void reportInviteResult(id, true)
+                    .then(() => getBridge()?.setToast("Invite marked as sent"))
+                    .catch((e: any) =>
+                      getBridge()?.setToast(e?.message ?? "Couldn't report the invite")
+                    );
+                }}
+              >
+                I've sent the invite
+              </Button>
+            )}
           </div>
         </Card>
       )}
@@ -311,12 +359,7 @@ export function RequestsView({ state }: { state: AppState }) {
   const decide = async (id: string, accept: boolean) => {
     setBusy(id);
     try {
-      await (accept ? acceptJoin(id) : declineJoin(id));
-      getBridge()?.store.update({
-        pendingRequests: (getBridge()?.store.state.pendingRequests ?? []).filter(
-          (r) => r.joinRequestId !== id
-        ),
-      });
+      await decideJoin(id, accept);
       getBridge()?.setToast(accept ? "Accepted — sending invite" : "Request declined");
     } catch (e: any) {
       getBridge()?.setToast(e?.body?.message ?? e?.message ?? "Action failed");
@@ -325,7 +368,9 @@ export function RequestsView({ state }: { state: AppState }) {
     }
   };
 
-  if (!rows.length) {
+  const outgoing = state.outgoingRequests ?? [];
+
+  if (!rows.length && !outgoing.length) {
     return (
       <Card>
         <EmptyState
@@ -344,6 +389,48 @@ export function RequestsView({ state }: { state: AppState }) {
           Refresh
         </Button>
       </div>
+      {outgoing.length > 0 && (
+        <Card>
+          <SectionTitle>Outgoing</SectionTitle>
+          {outgoing.map((r) => (
+            <div
+              key={r.id}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                padding: "8px 0",
+                borderTop: `1px solid ${c.border}`,
+              }}
+            >
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 650 }}>
+                  {r.creator ? `${r.creator.riotId}#${r.creator.tagLine}` : r.listingTitle ?? "Lobby"}
+                </div>
+                <div style={{ fontSize: 12, color: c.textDim }}>
+                  {r.status}
+                  {r.roleSlot ? ` · ${r.roleSlot}` : ""}
+                </div>
+              </div>
+              {(r.status === "PENDING" || r.status === "ACCEPTED") && (
+                <Button
+                  size="sm"
+                  disabled={busy === r.id}
+                  onClick={() => {
+                    setBusy(r.id);
+                    void cancelJoin(r.id)
+                      .then(() => getBridge()?.setToast("Request cancelled"))
+                      .catch((e: any) => getBridge()?.setToast(e?.message ?? "Couldn't cancel"))
+                      .finally(() => setBusy(null));
+                  }}
+                >
+                  Cancel
+                </Button>
+              )}
+            </div>
+          ))}
+        </Card>
+      )}
       {rows.map((r) => {
         const a = r.card?.account;
         const snap = r.card?.snapshot;
@@ -393,6 +480,9 @@ export function RequestsView({ state }: { state: AppState }) {
                 )}
               </div>
 
+              {a?.id && (
+                <PlayerMenu accountId={a.id} pendingJoinRequestId={r.joinRequestId} />
+              )}
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 <Button
                   variant="primary"
@@ -427,7 +517,20 @@ export function SessionView({
   bridge: LoblyBridge | null;
 }) {
   const [body, setBody] = useState("");
+  const [now, setNow] = useState(() => Date.now());
+  const scroller = useRef<HTMLDivElement>(null);
   const session = state.session;
+  const chatLen = session?.chat?.length ?? 0;
+
+  useEffect(() => {
+    scroller.current?.scrollTo({ top: scroller.current.scrollHeight });
+  }, [chatLen, session?.id]);
+
+  useEffect(() => {
+    if (!session?.chatOpenUntil) return;
+    const id = window.setInterval(() => setNow(Date.now()), 5000);
+    return () => window.clearInterval(id);
+  }, [session?.chatOpenUntil]);
 
   if (!session) {
     return (
@@ -440,12 +543,25 @@ export function SessionView({
     );
   }
 
+  const mine = new Set(
+    [state.riotAccountId, ...(state.linkedAccountIds ?? [])].filter(Boolean) as string[]
+  );
+  const chatClosed =
+    !!session.chatOpenUntil && Date.parse(session.chatOpenUntil) <= now;
   const send = () => {
     const text = body.trim();
-    if (!text) return;
+    if (!text || chatClosed) return;
     bridge?.sendChat?.(session.id, text);
     setBody("");
   };
+  const names = new Map<string, string>();
+  for (const m of session.chat ?? []) {
+    const id = m?.from?.accountId as string | undefined;
+    if (id && m?.from?.riotId) names.set(id, `${m.from.riotId}#${m.from.tagLine ?? ""}`);
+  }
+  for (const o of state.endorsePrompt?.others ?? []) {
+    names.set(o.accountId, `${o.riotId}#${o.tagLine}`);
+  }
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -461,35 +577,80 @@ export function SessionView({
         }}
       >
         <div style={{ padding: "16px 18px", borderBottom: `1px solid ${c.border}` }}>
-          <SectionTitle right={<Tag color={c.win}>Active</Tag>}>
+          <SectionTitle
+            right={
+              <div style={{ display: "flex", gap: 6 }}>
+                <Tag color={session.endedAt ? c.textDim : c.win}>
+                  {session.endedAt ? "Ended" : "Active"}
+                </Tag>
+                <Button
+                  size="sm"
+                  onClick={() => getBridge()?.store.update({ session: undefined })}
+                >
+                  Leave
+                </Button>
+              </div>
+            }
+          >
             Session chat · {session.memberAccountIds.length} members
           </SectionTitle>
+          {session.memberAccountIds.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
+              {session.memberAccountIds.map((id) => (
+                <span key={id} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                  <span style={{ fontSize: 12, color: c.textDim }}>{names.get(id) ?? id.slice(0, 8)}</span>
+                  {!mine.has(id) && <PlayerMenu accountId={id} sessionId={session.id} />}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
-        <div style={{ flex: 1, overflowY: "auto", padding: 18 }}>
+        <div ref={scroller} style={{ flex: 1, overflowY: "auto", padding: 18 }}>
           {!session.chat?.length && (
             <div style={{ color: c.textFaint, textAlign: "center", paddingTop: 40 }}>
               Say hello — chat stays open until 10 minutes after your last game.
             </div>
           )}
-          {(session.chat ?? []).map((m: any, i: number) => (
-            <div key={i} style={{ marginBottom: 10 }}>
-              <div style={{ fontSize: 11, color: c.textFaint, marginBottom: 2 }}>
-                {m.from?.riotId ?? m.fromAccountId ?? "Player"}
-              </div>
+          {(session.chat ?? []).map((m: any, i: number) => {
+            const accountId = m.from?.accountId ?? m.fromAccountId;
+            const own = accountId && mine.has(accountId);
+            const label = m.from?.riotId
+              ? `${m.from.riotId}#${m.from.tagLine ?? ""}`
+              : (accountId ?? "Player");
+            const when = m.at ?? m.createdAt;
+            return (
               <div
+                key={m.id ?? i}
                 style={{
-                  background: "linear-gradient(135deg, rgba(66,215,255,.1), rgba(155,123,255,.08))",
-                  border: `1px solid ${c.border}`,
-                  borderRadius: `${radius.sm}px ${radius.lg}px ${radius.lg}px ${radius.lg}px`,
-                  padding: "9px 13px",
-                  display: "inline-block",
-                  maxWidth: "80%",
+                  marginBottom: 10,
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: own ? "flex-end" : "flex-start",
                 }}
               >
-                {m.body}
+                <div style={{ fontSize: 11, color: c.textFaint, marginBottom: 2 }}>
+                  {label}
+                  {when ? ` · ${formatChatTime(when)}` : ""}
+                </div>
+                <div
+                  style={{
+                    background: own
+                      ? "linear-gradient(135deg, rgba(66,215,255,.18), rgba(155,123,255,.12))"
+                      : "linear-gradient(135deg, rgba(66,215,255,.1), rgba(155,123,255,.08))",
+                    border: `1px solid ${c.border}`,
+                    borderRadius: own
+                      ? `${radius.lg}px ${radius.sm}px ${radius.lg}px ${radius.lg}px`
+                      : `${radius.sm}px ${radius.lg}px ${radius.lg}px ${radius.lg}px`,
+                    padding: "9px 13px",
+                    display: "inline-block",
+                    maxWidth: "80%",
+                  }}
+                >
+                  {m.body}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
         <div
           style={{
@@ -502,9 +663,10 @@ export function SessionView({
         >
           <input
             value={body}
+            disabled={chatClosed}
             onChange={(e) => setBody(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && send()}
-            placeholder="Message your teammates…"
+            placeholder={chatClosed ? "Chat closed" : "Message your teammates…"}
             style={{
               flex: 1,
               background: c.surfaceAlt,
@@ -515,7 +677,7 @@ export function SessionView({
               fontSize: 13,
             }}
           />
-          <Button variant="primary" onClick={send}>
+          <Button variant="primary" onClick={send} disabled={chatClosed}>
             Send
           </Button>
         </div>
@@ -543,7 +705,12 @@ export function SessionView({
                   size="sm"
                   onClick={async () => {
                     try {
-                      await endorse(state.endorsePrompt!.sessionId, o.accountId, [kind]);
+                      await endorse(
+                        state.endorsePrompt!.sessionId,
+                        o.accountId,
+                        [kind],
+                        state.endorsePrompt!.gameId
+                      );
                       getBridge()?.setToast("Endorsement sent");
                     } catch (e: any) {
                       getBridge()?.setToast(e?.message ?? "Endorse failed");
@@ -559,4 +726,10 @@ export function SessionView({
       )}
     </div>
   );
+}
+
+function formatChatTime(at: string): string {
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }

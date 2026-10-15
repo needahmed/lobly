@@ -18,6 +18,7 @@ import {
   type RankPreset,
 } from "../state/publishDraft";
 import { setPublishDraft } from "../state/listingMachine";
+import { LanguageMultiSelect } from "./LanguageSelect";
 import { c, radius, ROLE_LABEL } from "./theme";
 import { Button, RoleIcon, SectionTitle, Tag } from "./components";
 
@@ -476,19 +477,10 @@ export function PublishForm({
           </select>
         </Field>
         <Field label="Language">
-          <input
-            style={inputStyle}
-            value={draft.languages.join(",")}
+          <LanguageMultiSelect
+            value={draft.languages}
             disabled={live && !editing}
-            onChange={(e) =>
-              patch({
-                languages: e.target.value
-                  .split(",")
-                  .map((x) => x.trim())
-                  .filter(Boolean),
-              })
-            }
-            placeholder="en"
+            onChange={(languages) => patch({ languages })}
           />
         </Field>
         <Field label="Voice">

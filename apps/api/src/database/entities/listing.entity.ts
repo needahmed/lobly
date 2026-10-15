@@ -12,6 +12,7 @@ import { RiotAccount } from "./riot-account.entity";
 import { JoinRequest } from "./join-request.entity";
 import type {
   ListingFilters,
+  ListingParty,
   ListingQueueMeta,
   ListingSlot,
   ListingType,
@@ -55,6 +56,10 @@ export class Listing {
   @Column({ type: "jsonb" })
   slots!: ListingSlot[];
 
+  /** Live party snapshot from the creator's client. Default {}. */
+  @Column({ type: "jsonb", default: {} })
+  party!: ListingParty;
+
   @Column({ name: "queue_meta", type: "jsonb", default: {} })
   queueMeta!: ListingQueueMeta;
 
@@ -72,6 +77,10 @@ export class Listing {
 
   @Column({ name: "paused_at", type: "timestamptz", nullable: true })
   pausedAt!: Date | null;
+
+  /** Set to NO_SEATS when the seat reconciler pauses the listing. */
+  @Column({ name: "pause_reason", type: "text", nullable: true })
+  pauseReason!: string | null;
 
   @Column({ name: "delisted_at", type: "timestamptz", nullable: true })
   delistedAt!: Date | null;

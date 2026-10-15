@@ -7,11 +7,12 @@ export type ReliabilityKind =
   | "SHOWED"
   | "NO_SHOW"
   | "ABANDONED"
-  | "COMPLETED";
+  | "COMPLETED"
+  | "CANCELLED_AFTER_ACCEPT";
 
 export interface SessionSummary {
   id: string;
-  listingId: string;
+  listingId: string | null;
   memberAccountIds: string[];
   leagueLobbyConfirmedAt: string | null;
   startedQueueAt: string | null;
@@ -45,4 +46,12 @@ export interface FeatureFlags {
   autoAccept: boolean;
   board: boolean;
   allowedPlatforms: string[];
+  /** Client sends PATCH /listings/:id/party. Default on. */
+  partySync: boolean;
+  /** game.ended schedules the delayed Riot refresh. Default on. */
+  postgameLoop: boolean;
+  /** Organic (non-listing) sessions can be endorsed. Default off. */
+  organicEndorse: boolean;
+  /** Legacy 3s lobby polling. Default on until party sync is stable. */
+  clientLobbyWatch: boolean;
 }

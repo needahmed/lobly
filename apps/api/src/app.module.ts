@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
 import { ConfigModule, ConfigService } from "@nestjs/config";
+import { EventEmitterModule } from "@nestjs/event-emitter";
 import { TypeOrmModule } from "@nestjs/typeorm";
 import { BullModule } from "@nestjs/bullmq";
 import { APP_GUARD } from "@nestjs/core";
@@ -17,6 +18,7 @@ import { MetricsModule } from "./modules/metrics/metrics.module";
 import { ReputationModule } from "./modules/reputation/reputation.module";
 import { SessionModule } from "./modules/session/session.module";
 import { JoinModule } from "./modules/join/join.module";
+import { GameModule } from "./modules/game/game.module";
 
 const REQUIRED_ENV = [
   "DATABASE_URL",
@@ -38,6 +40,7 @@ validateEnv();
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    EventEmitterModule.forRoot(),
     RedisModule,
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
@@ -69,6 +72,7 @@ validateEnv();
     ReputationModule,
     SessionModule,
     JoinModule,
+    GameModule,
     RealtimeModule,
     ConfigApiModule,
   ],

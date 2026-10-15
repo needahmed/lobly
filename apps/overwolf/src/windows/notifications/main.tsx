@@ -1,7 +1,18 @@
 import { createRoot } from "react-dom/client";
 import { useEffect } from "react";
-import { useAppStore, getBridge } from "@lobly/client-core";
+import {
+  useAppStore,
+  getBridge,
+  decideJoin,
+  configureLoblyCore,
+  createNoopHostAdapter,
+  loadStoredAuth,
+} from "@lobly/client-core";
 import { hideWindow, positionNotificationsBottomRight, restoreWindow } from "../../shared/ow";
+import { BACKEND_URL } from "../../config";
+
+configureLoblyCore(createNoopHostAdapter(BACKEND_URL));
+loadStoredAuth();
 
 function ToastApp() {
   const state = useAppStore();
@@ -49,7 +60,9 @@ function ToastApp() {
           <button
             style={actionBtn}
             onClick={() => {
-              void getBridge()?.acceptJoin?.(pending.joinRequestId);
+              void decideJoin(pending.joinRequestId, true).catch((e: any) =>
+                getBridge()?.setToast(e?.message ?? "Accept failed")
+              );
               getBridge()?.store.clearToast();
             }}
           >
@@ -58,7 +71,9 @@ function ToastApp() {
           <button
             style={actionBtn}
             onClick={() => {
-              void getBridge()?.declineJoin?.(pending.joinRequestId);
+              void decideJoin(pending.joinRequestId, false).catch((e: any) =>
+                getBridge()?.setToast(e?.message ?? "Decline failed")
+              );
               getBridge()?.store.clearToast();
             }}
           >

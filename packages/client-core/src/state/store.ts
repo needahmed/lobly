@@ -4,6 +4,9 @@ import {
   type GameflowPhase,
   type LobbyCapability,
   type ListingSummary,
+  type GameContext,
+  type PartyState,
+  type PostgameReadyPayload,
 } from "@lobly/shared-types";
 import type { PublishDraft } from "./publishDraft";
 
@@ -17,6 +20,16 @@ export interface PendingRequest {
   roleSlot: string | null;
 }
 
+export interface OutgoingRequest {
+  id: string;
+  listingId: string;
+  status: string;
+  roleSlot: string | null;
+  createdAt?: string;
+  listingTitle?: string | null;
+  creator?: { riotId: string; tagLine: string } | null;
+}
+
 export interface AppState {
   lcu: { connected: boolean; port?: string; token?: string };
   summoner?: {
@@ -25,9 +38,33 @@ export interface AppState {
     tagLine: string;
     summonerId: number;
     platform: string;
+    profileIconId?: number;
   };
   gameflowPhase: GameflowPhase;
   lobby?: unknown;
+  /** The user's own League party as seen by the GameFlowTracker. */
+  party?: PartyState | null;
+  /** Frozen when a game starts (input for the end-of-game loop). */
+  gameContext?: GameContext | null;
+  /** End-of-game screen: local preview, then the confirmed match. */
+  postGame?: {
+    gameId: number | null;
+    queueId: number | null;
+    local: {
+      win: boolean | null;
+      championId: number | null;
+      kills: number | null;
+      deaths: number | null;
+      assists: number | null;
+      durationSec: number | null;
+    } | null;
+    ready: PostgameReadyPayload | null;
+    mode: "hidden" | "full" | "banner";
+    dismissed: boolean;
+    rankBefore?: { tier: string | null; division: string | null } | null;
+  } | null;
+  /** Listing was delisted because the League queue changed. */
+  queueDrift?: boolean;
   /** Derived from the live League lobby gameConfig. */
   lobbyCapability?: LobbyCapability | null;
   listing: { status: ListingStatus; id?: string };
@@ -41,7 +78,6 @@ export interface AppState {
   log: string[];
   toast: { message: string; at: number } | null;
   publishReason: string | null;
-  sessionEndPending: boolean;
   board?: unknown[];
   /** Bumped on board.delta so Find Team can refetch. */
   boardRevision?: number;
@@ -50,10 +86,34 @@ export interface AppState {
     id: string;
     memberAccountIds: string[];
     chat: any[];
+    endedAt?: string | null;
+    chatOpenUntil?: string | null;
   };
+  /** True once boot has decided whether a stored session exists. */
+  authChecked: boolean;
+  authenticated: boolean;
+  /** Tokens are on disk even if the API could not be reached yet. */
+  hasStoredSession: boolean;
+  authExpired: boolean;
+  /** Backend was unreachable at boot; the UI retries with backoff. */
+  apiUnreachable: boolean;
+  /** League account switched to one that is not linked to this user. */
+  accountMismatch: boolean;
+  devAuthEnabled: boolean;
+  outgoingRequests: OutgoingRequest[];
+  uiTab?: string;
+  notificationsEnabled: boolean;
+  autoAcceptQueue: boolean;
+  openOnGameEnd: boolean;
+  openAtLogin?: boolean;
+  signInPhase: string | null;
+  linkedAccountIds: string[];
+  linkedRiotIds: string[];
+  linkedLcuPuuids: string[];
   endorsePrompt?: {
     sessionId: string;
-    others: { accountId: string; riotId: string; tagLine: string }[];
+    gameId?: number;
+    others: { accountId: string; riotId: string; tagLine: string; role?: string | null }[];
   } | null;
   manualInvite?: { joinRequestId: string; riotId: string } | null;
   autoAcceptLoblyInvites?: boolean;
@@ -78,6 +138,8 @@ class Store {
     gameflowPhase: "None",
     listing: { status: ListingStatus.DRAFT },
     lobbyCapability: null,
+    party: null,
+    gameContext: null,
     publishDraft: null,
     myListing: null,
     gep: { features: [], active: false },
@@ -86,9 +148,25 @@ class Store {
     log: [],
     toast: null,
     publishReason: null,
-    sessionEndPending: false,
     boardRevision: 0,
     pendingRequests: [],
+    outgoingRequests: [],
+    authChecked: false,
+    authenticated: false,
+    hasStoredSession: false,
+    authExpired: false,
+    apiUnreachable: false,
+    accountMismatch: false,
+    devAuthEnabled: false,
+    notificationsEnabled: true,
+    autoAcceptQueue: false,
+    openOnGameEnd: true,
+    postGame: null,
+    queueDrift: false,
+    signInPhase: null,
+    linkedAccountIds: [],
+    linkedRiotIds: [],
+    linkedLcuPuuids: [],
     autoAcceptLoblyInvites: false,
     endorsePrompt: null,
     manualInvite: null,
@@ -140,6 +218,7 @@ class Store {
       gameflowPhase: "None",
       lobby: undefined,
       lobbyCapability: null,
+      party: null,
     });
     this.logLine("LCU down — credentials cleared");
   }
@@ -170,6 +249,33 @@ class Store {
 
   clearToast() {
     this.update({ toast: null });
+  }
+
+  /** Drop the signed-in session. League client connection stays. */
+  resetForSignOut() {
+    this.update({
+      authenticated: false,
+      authExpired: false,
+      hasStoredSession: false,
+      accountMismatch: false,
+      authChecked: true,
+      apiUnreachable: false,
+      signInPhase: null,
+      riotAccountId: undefined,
+      profileHints: undefined,
+      listing: { status: ListingStatus.DRAFT },
+      myListing: null,
+      publishDraft: null,
+      pendingRequests: [],
+      outgoingRequests: [],
+      session: undefined,
+      endorsePrompt: null,
+      manualInvite: null,
+      linkedAccountIds: [],
+      linkedRiotIds: [],
+      linkedLcuPuuids: [],
+      uiTab: "profile",
+    });
   }
 }
 

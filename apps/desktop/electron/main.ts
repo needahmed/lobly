@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu, type IpcMainEvent } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, Notification, Tray, type IpcMainEvent } from "electron";
 import path from "node:path";
 import { installLocalStorageShim } from "./localStorageShim";
 
@@ -15,7 +15,16 @@ import {
   syncAgent,
   ensureSession,
   getAccessToken,
-  linkCurrentSummoner,
+  refreshAccessToken,
+  startSessionBootstrap,
+  noteSummonerSwitch,
+  adoptLinkedAccounts,
+  signOut,
+  completeRiotSignIn,
+  linkAnotherAccount,
+  loadClientSettings,
+  watchClientSettings,
+  gameFlowTracker,
   fetchBoard,
   acceptJoin,
   declineJoin,
@@ -37,6 +46,7 @@ const DEV_PASSWORD =
   process.env.LOBLY_DEV_PASSWORD ||
   process.env.LOBLY_PACKAGED_DEV_PASSWORD ||
   "lobly-dev-password";
+const DEV_AUTH = process.env.LOBLY_DEV_AUTH === "1";
 const DISCOVERY_POLL_MS = 3000;
 const APP_USER_MODEL_ID = "com.lobly.desktop";
 
@@ -46,8 +56,12 @@ if (process.platform === "win32") {
 }
 
 let mainWindow: BrowserWindow | null = null;
+let tray: Tray | null = null;
+let quitting = false;
 let currentCreds: ElectronCreds | null = null;
 let lastCredsKey = "";
+const startHidden = process.argv.includes("--hidden");
+let hiddenUntilLeague = startHidden;
 
 function isDesktopHidden(): Promise<boolean> {
   if (!mainWindow) return Promise.resolve(true);
@@ -71,6 +85,33 @@ configureLoblyCore({
   lcuTransport: transport,
   eventBus,
   isDesktopHidden,
+  isDevAuthEnabled: () => DEV_AUTH,
+  notify: (title, body, opts) => {
+    if (!Notification.isSupported()) return;
+    const hidden =
+      !mainWindow ||
+      mainWindow.isDestroyed() ||
+      mainWindow.isMinimized() ||
+      !mainWindow.isVisible() ||
+      !mainWindow.isFocused();
+    if (!hidden) return;
+    const note = new Notification({ title, body });
+    note.on("click", () => {
+      showMainWindow();
+      if (opts?.tab) {
+        appStore.update({ uiTab: opts.tab });
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send(IPC.NAVIGATE, opts.tab);
+        }
+      }
+    });
+    note.show();
+  },
+  showWindowInactive: () => showMainWindowInactive(),
+  setOpenAtLogin: (open) => {
+    app.setLoginItemSettings({ openAtLogin: open, args: open ? ["--hidden"] : [] });
+    appStore.update({ openAtLogin: open });
+  },
 });
 
 function pollForLeagueClient() {
@@ -82,6 +123,7 @@ function pollForLeagueClient() {
     currentCreds = { port: found.port, token: found.token };
     appStore.update({ lcu: { connected: true, port: found.port } });
     appStore.logLine(`LCU credentials found via ${found.source} (port ${found.port})`);
+    if (hiddenUntilLeague) showMainWindow();
     eventBus.stop();
     eventBus.start();
     // The WebSocket only pushes changes, so read whatever is already true
@@ -101,6 +143,7 @@ function pollForLeagueClient() {
     lastCredsKey = "";
     currentCreds = null;
     eventBus.stop();
+    gameFlowTracker.noteLauncherClosed();
     appStore.setLcuDown();
 
     const st = appStore.state.listing.status;
@@ -137,22 +180,22 @@ async function verifySummoner() {
       /* fall back to "unknown" — link endpoint rejects this cleanly */
     }
 
-    const switched = prevPuuid != null;
+    const gameName = s.gameName ?? s.displayName?.split("#")[0] ?? "";
+    const tagLine = s.tagLine ?? "";
+    const switched = await noteSummonerSwitch({ puuid: s.puuid, gameName, tagLine });
     appStore.update({
       summoner: {
         puuid: s.puuid,
-        gameName: s.gameName ?? s.displayName?.split("#")[0] ?? "",
-        tagLine: s.tagLine ?? "",
+        gameName,
+        tagLine,
         summonerId: Number(s.summonerId),
         platform,
+        profileIconId: typeof s.profileIconId === "number" ? s.profileIconId : undefined,
       },
-      // A different Riot ID means a different linked account (or none yet)
-      // — carrying over the old riotAccountId/profileHints/myListing would
-      // show the previous account's data under the new one's name.
-      ...(switched
-        ? { riotAccountId: undefined, profileHints: undefined, myListing: null }
-        : {}),
     });
+    if (switched && appStore.state.authenticated && !appStore.state.accountMismatch) {
+      void adoptLinkedAccounts().catch((e) => appStore.logLine(`accounts: ${e?.message ?? e}`));
+    }
     appStore.logLine(
       `${switched ? "Account switched — now " : "Summoner verified: "}${s.gameName ?? "?"}#${s.tagLine ?? ""} (${platform})`
     );
@@ -229,12 +272,15 @@ function registerIpc() {
   // before answering.
   let announcedRendererAuth = false;
   ipcMain.handle(IPC.GET_AUTH_TOKEN, async (_event, force?: boolean) => {
-    if (force || !getAccessToken()) {
-      try {
-        await ensureSession(DEV_EMAIL, DEV_PASSWORD);
-      } catch (e: any) {
-        appStore.logLine(`Re-auth failed: ${e?.message ?? e}`);
-        return null;
+    if (force) {
+      const refreshed = await refreshAccessToken();
+      if (!refreshed && DEV_AUTH) {
+        try {
+          await ensureSession(DEV_EMAIL, DEV_PASSWORD);
+        } catch (e: any) {
+          appStore.logLine(`Re-auth failed: ${e?.message ?? e}`);
+          return null;
+        }
       }
     }
     const token = getAccessToken();
@@ -263,6 +309,24 @@ function registerIpc() {
 
   ipcMain.handle(IPC.DECLINE_JOIN, async (_event, id: string) => {
     await declineJoin(id);
+  });
+
+  ipcMain.handle(IPC.RIOT_SIGN_IN, async () => {
+    await completeRiotSignIn();
+  });
+  ipcMain.handle(IPC.LINK_ACCOUNT, async () => {
+    await linkAnotherAccount();
+  });
+  ipcMain.handle(IPC.DEV_SIGN_IN, async (_event, email: string, password: string) => {
+    if (!DEV_AUTH) throw new Error("Dev login is disabled");
+    await ensureSession(email, password);
+  });
+  ipcMain.handle(IPC.SIGN_OUT, async () => {
+    await signOut();
+  });
+  ipcMain.on(IPC.SET_OPEN_AT_LOGIN, (_event, open: boolean) => {
+    app.setLoginItemSettings({ openAtLogin: !!open, args: open ? ["--hidden"] : [] });
+    appStore.update({ openAtLogin: !!open });
   });
 
   ipcMain.on(IPC.WINDOW_MINIMIZE, (event) => {
@@ -331,7 +395,16 @@ function createWindow() {
   window.removeMenu();
   window.on("maximize", () => pushMaximizedState(window));
   window.on("unmaximize", () => pushMaximizedState(window));
-  window.once("ready-to-show", () => window.show());
+  window.once("ready-to-show", () => {
+    if (!startHidden) window.show();
+  });
+  window.on("close", (event) => {
+    if (quitting) return;
+    if (listingOrSessionOpen()) {
+      event.preventDefault();
+      window.hide();
+    }
+  });
   window.on("closed", () => {
     if (mainWindow === window) mainWindow = null;
   });
@@ -366,59 +439,96 @@ function createWindow() {
   void window.loadFile(indexPath);
 }
 
-app.whenReady().then(async () => {
-  Menu.setApplicationMenu(null);
-  registerIpc();
-  createWindow();
-  wireListingMachineToBus();
-  pollForLeagueClient();
+function showMainWindow() {
+  hiddenUntilLeague = false;
+  if (!mainWindow || mainWindow.isDestroyed()) createWindow();
+  const window = mainWindow;
+  if (!window || window.isDestroyed()) return;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+}
 
+/** End-of-game: show LOBLY without taking focus from the League client. */
+function showMainWindowInactive() {
+  hiddenUntilLeague = false;
+  if (!mainWindow || mainWindow.isDestroyed()) createWindow();
+  const window = mainWindow;
+  if (!window || window.isDestroyed()) return;
+  if (window.isMinimized()) window.restore();
+  window.showInactive();
+}
+
+function listingOrSessionOpen() {
+  const st = appStore.state.listing.status;
+  const listingLive = st !== "DRAFT" && st !== "DELISTED";
+  const sessionOpen = !!appStore.state.session && !appStore.state.session.endedAt;
+  return listingLive || sessionOpen;
+}
+
+function createTray() {
   try {
-    appStore.logLine(`Connecting to ${BACKEND_URL}…`);
-    // Never let a hung backend leave the app silently signed-out with no
-    // clue in the log about what it is waiting for.
-    await withTimeout(
-      ensureSession(DEV_EMAIL, DEV_PASSWORD),
-      15_000,
-      "backend did not respond within 15s"
-    );
-    let lastPuuid: string | undefined;
-    appStore.subscribe(() => {
-      const puuid = appStore.state.summoner?.puuid;
-      // puuid !== lastPuuid is the only de-dup key that should exist here.
-      // This used to ALSO skip whenever riotAccountId was already set,
-      // which was correct for "don't re-link the same account twice" but
-      // wrong for "a different account just logged in" — riotAccountId
-      // stays set from the FIRST link for the rest of the process's life,
-      // so switching League accounts without restarting LOBLY silently
-      // kept showing the old account forever. verifySummoner() now clears
-      // riotAccountId itself when it detects a puuid change, so this check
-      // alone is sufficient again.
-      if (!puuid || puuid === lastPuuid) return;
-      lastPuuid = puuid;
-      void linkCurrentSummoner().catch((e) =>
-        appStore.logLine(`link: ${e?.message ?? e}`)
-      );
-    });
-  } catch (e: any) {
-    appStore.logLine(`API auth failed (${e?.message ?? e}) — using dev-local sync`);
-    syncAgent.connect("dev-local");
+  const icon = path.join(__dirname, "../assets/lobly.ico");
+  tray = new Tray(icon);
+  tray.setToolTip("LOBLY");
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: "Open LOBLY", click: () => showMainWindow() },
+      { label: "Unpublish lobby", click: () => dispatchMachine({ type: "UNPUBLISH" }) },
+      { label: "Quit", click: () => void quitApp() },
+    ])
+  );
+  tray.on("click", () => showMainWindow());
+  } catch (e) {
+    console.error("tray icon unavailable", e);
   }
+}
 
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+async function quitApp() {
+  quitting = true;
+  const st = appStore.state.listing.status;
+  if (st !== "DRAFT" && st !== "DELISTED") {
+    dispatchMachine({ type: "UNPUBLISH" });
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  app.quit();
+}
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on("second-instance", () => showMainWindow());
+  app.whenReady().then(() => {
+    Menu.setApplicationMenu(null);
+    loadClientSettings();
+    watchClientSettings();
+    appStore.update({
+      devAuthEnabled: DEV_AUTH,
+      openAtLogin: app.getLoginItemSettings().openAtLogin,
+    });
+    registerIpc();
+    createWindow();
+    createTray();
+    wireListingMachineToBus();
+    pollForLeagueClient();
+    appStore.logLine(`Connecting to ${BACKEND_URL}…`);
+    startSessionBootstrap(
+      DEV_AUTH
+        ? { devAuth: true, devEmail: DEV_EMAIL, devPassword: DEV_PASSWORD }
+        : undefined
+    );
+
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
   });
+}
+
+app.on("before-quit", () => {
+  quitting = true;
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
+  if (quitting && process.platform !== "darwin") app.quit();
+  else if (!listingOrSessionOpen() && process.platform !== "darwin") app.quit();
 });
-
-function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(message)), ms)
-    ),
-  ]);
-}

@@ -7,13 +7,15 @@ import {
   ParseUUIDPipe,
   Post,
 } from "@nestjs/common";
-import { IsBoolean, IsOptional, IsString } from "class-validator";
+import { IsBoolean, IsIn, IsOptional, IsString } from "class-validator";
+import { ALL_ROLES } from "@lobly/shared-types";
 import { CurrentUser, type JwtPayload } from "../../common/decorators/current-user.decorator";
 import { JoinService } from "./join.service";
 
 class JoinDto {
   @IsOptional()
   @IsString()
+  @IsIn(ALL_ROLES)
   roleSlot?: string;
 }
 
@@ -29,6 +31,11 @@ class InviteResultDto {
 @Controller()
 export class JoinController {
   constructor(private readonly joins: JoinService) {}
+
+  @Get("join-requests/mine")
+  mine(@CurrentUser() user: JwtPayload) {
+    return this.joins.listMine(user.sub);
+  }
 
   @Post("listings/:id/join")
   join(

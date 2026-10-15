@@ -81,7 +81,6 @@ function handleNewEvents(payload: any) {
   const events = payload?.events ?? [];
   for (const ev of events) {
     if (ev?.name === "end_game" || payload?.feature === "end_game") {
-      appStore.update({ sessionEndPending: true });
       appStore.logLine("GEP end_game event");
     }
   }
@@ -118,7 +117,7 @@ function routeInfo(feature: string | undefined, info: any) {
   }
 
   if (feature === "end_game" || info.end_game) {
-    appStore.update({ sessionEndPending: true });
+    appStore.logLine("GEP end_game info");
   }
 }
 

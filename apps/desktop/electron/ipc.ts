@@ -19,6 +19,12 @@ export const IPC = {
   WINDOW_CLOSE: "lobly:window:close",
   WINDOW_IS_MAXIMIZED: "lobly:window:isMaximized", // sync
   WINDOW_MAXIMIZED_CHANGED: "lobly:window:maximizedChanged", // main -> renderer
+  NAVIGATE: "lobly:navigate", // main -> renderer
+  SET_OPEN_AT_LOGIN: "lobly:setOpenAtLogin",
+  RIOT_SIGN_IN: "lobly:riotSignIn",
+  LINK_ACCOUNT: "lobly:linkAccount",
+  DEV_SIGN_IN: "lobly:devSignIn",
+  SIGN_OUT: "lobly:signOut",
 } as const;
 
 export type StoreAction =

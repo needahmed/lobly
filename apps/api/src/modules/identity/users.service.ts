@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
-import { In, Repository } from "typeorm";
+import { ArrayOverlap, In, Repository } from "typeorm";
 import {
   Block,
   ChampionStat,
@@ -68,8 +68,10 @@ export class UsersService {
       await this.matches.delete({ riotAccountId: In(accountIds) });
       await this.snapshots.delete({ riotAccountId: In(accountIds) });
 
-      // Remove user from open sessions membership
-      const openSessions = await this.sessions.find();
+      // Only sessions that actually list one of this user's accounts.
+      const openSessions = await this.sessions.find({
+        where: { memberAccountIds: ArrayOverlap(accountIds) },
+      });
       for (const s of openSessions) {
         if (s.memberAccountIds.some((id) => accountIds.includes(id))) {
           s.memberAccountIds = s.memberAccountIds.filter(

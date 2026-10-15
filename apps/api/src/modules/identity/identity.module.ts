@@ -20,12 +20,16 @@ import {
 } from "../../database/entities";
 import { RiotModule } from "../riot/riot.module";
 import { ProfileModule } from "../profile/profile.module";
+import { LobbyModule } from "../lobby/lobby.module";
+import { JoinModule } from "../join/join.module";
+import { RealtimeModule } from "../realtime/realtime.module";
 import { AuthController } from "./auth.controller";
 import { AuthService } from "./auth.service";
 import { JwtStrategy } from "./jwt.strategy";
 import { JwtAuthGuard } from "./jwt-auth.guard";
 import { RiotAccountsController } from "./riot-accounts.controller";
 import { RiotAccountsService } from "./riot-accounts.service";
+import { RiotAuthService } from "./riot-auth.service";
 import { UsersController } from "./users.controller";
 import { UsersService } from "./users.service";
 
@@ -51,10 +55,14 @@ import { UsersService } from "./users.service";
     JwtModule.register({}),
     RiotModule,
     forwardRef(() => ProfileModule),
+    forwardRef(() => LobbyModule),
+    forwardRef(() => JoinModule),
+    forwardRef(() => RealtimeModule),
   ],
   controllers: [AuthController, RiotAccountsController, UsersController],
   providers: [
     AuthService,
+    RiotAuthService,
     JwtStrategy,
     JwtAuthGuard,
     RiotAccountsService,

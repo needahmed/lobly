@@ -1,6 +1,6 @@
 import https from "node:https";
 import { WebSocket } from "ws";
-import type { LcuTransport, CoreEventBus } from "@lobly/client-core";
+import type { LcuTransport, CoreEventBus, LcuBusEvent } from "@lobly/client-core";
 import endpointMap from "@lobly/lcu-endpoints";
 
 // Local-only, self-signed LCU cert (127.0.0.1). Never disable verification
@@ -13,9 +13,18 @@ interface Endpoints {
 }
 const ENDPOINTS = endpointMap as unknown as Endpoints;
 
-/** Exact URIs the WAMP subscriptions are allowed to deliver. */
-const PHASE_URI = ENDPOINTS.endpoints.gameflowPhase.path;
-const LOBBY_URI = ENDPOINTS.endpoints.lobby.path;
+/**
+ * Exact URIs the WAMP subscriptions are allowed to deliver, and the bus event
+ * each one feeds. Anything else on the socket (sub-resources such as
+ * /lol-lobby/v2/lobby/members or /lol-champ-select/v1/session/timer) is
+ * dropped — see the exact-match note in the message handler.
+ */
+const URI_TO_EVENT = new Map<string, LcuBusEvent>([
+  [ENDPOINTS.endpoints.gameflowPhase.path, "phase"],
+  [ENDPOINTS.endpoints.gameflowSession.path, "gameflowSession"],
+  [ENDPOINTS.endpoints.champSelectSession.path, "champSelect"],
+  [ENDPOINTS.endpoints.lobby.path, "lobby"],
+]);
 
 export interface ElectronCreds {
   port: string;
@@ -125,7 +134,7 @@ type Handler = (data: unknown) => void;
  */
 export class ElectronLcuEventBus implements CoreEventBus {
   private ws: WebSocket | null = null;
-  private handlers = new Map<"phase" | "lobby", Set<Handler>>();
+  private handlers = new Map<LcuBusEvent, Set<Handler>>();
   private backoff = 1000;
   private stopped = true;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -139,7 +148,7 @@ export class ElectronLcuEventBus implements CoreEventBus {
     private onSubscribed?: () => void
   ) {}
 
-  on(evt: "phase" | "lobby", handler: Handler) {
+  on(evt: LcuBusEvent, handler: Handler) {
     if (!this.handlers.has(evt)) this.handlers.set(evt, new Set());
     this.handlers.get(evt)!.add(handler);
   }
@@ -157,7 +166,7 @@ export class ElectronLcuEventBus implements CoreEventBus {
     this.ws = null;
   }
 
-  private emit(evt: "phase" | "lobby", data: unknown) {
+  private emit(evt: LcuBusEvent, data: unknown) {
     this.handlers.get(evt)?.forEach((h) => h(data));
   }
 
@@ -195,12 +204,12 @@ export class ElectronLcuEventBus implements CoreEventBus {
       // delivers its sub-resources (…/members, …/invitations), whose
       // payloads are not lobby objects — matching loosely lets those
       // clobber the real lobby with a shape that has no queueId.
-      const uri = evt?.uri;
-      if (uri !== PHASE_URI && uri !== LOBBY_URI) return;
+      const busEvent = evt?.uri ? URI_TO_EVENT.get(evt.uri) : undefined;
+      if (!busEvent) return;
       // A Delete event means the resource is gone; its `data` may still echo
       // the last known value, so normalize it to null.
       const payload = evt?.eventType === "Delete" ? null : evt?.data;
-      this.emit(uri === PHASE_URI ? "phase" : "lobby", payload);
+      this.emit(busEvent, payload);
     });
 
     this.ws.on("close", () => {

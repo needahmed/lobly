@@ -13,7 +13,13 @@ import { ConfigService } from "@nestjs/config";
 import { Server, Socket } from "socket.io";
 import { createAdapter } from "@socket.io/redis-adapter";
 import Redis from "ioredis";
-import { SocketEvents, ListingStatus } from "@lobly/shared-types";
+import {
+  SocketEvents,
+  ListingStatus,
+  type GameEndedPayload,
+  type GameStartedPayload,
+} from "@lobly/shared-types";
+import { GameLifecycleService } from "../game/game-lifecycle.service";
 import { ListingsService } from "../lobby/listings.service";
 import { RiotAccountsService } from "../identity/riot-accounts.service";
 import { PresenceService } from "./presence.service";
@@ -43,10 +49,43 @@ export class SyncGateway implements OnGatewayInit, OnGatewayConnection {
     @Inject(forwardRef(() => JoinService))
     private readonly joins: JoinService,
     @Inject(forwardRef(() => SessionService))
-    private readonly sessions: SessionService
+    private readonly sessions: SessionService,
+    @Inject(forwardRef(() => GameLifecycleService))
+    private readonly games: GameLifecycleService
   ) {}
 
   afterInit(server: Server) {
+    server.use((socket, next) => {
+      const token =
+        (socket.handshake.auth?.token as string | undefined) ??
+        (socket.handshake.headers.authorization?.replace(/^Bearer\s+/i, "") as
+          | string
+          | undefined);
+      if (!token) {
+        next(new Error("unauthorized"));
+        return;
+      }
+      if (token.startsWith("dev-")) {
+        if (process.env.LOBLY_ALLOW_DEV_SOCKET === "1") {
+          socket.data.userId = `dev:${token}`;
+          next();
+          return;
+        }
+        next(new Error("unauthorized"));
+        return;
+      }
+      try {
+        const payload = this.jwt.verify<{ sub: string }>(token, {
+          secret: this.config.getOrThrow<string>("JWT_SECRET"),
+        });
+        socket.data.userId = payload.sub;
+        next();
+      } catch {
+        this.logger.warn(`reject ${socket.id}: bad jwt`);
+        next(new Error("unauthorized"));
+      }
+    });
+
     const url = this.config.getOrThrow<string>("REDIS_URL");
     const pub = new Redis(url, { maxRetriesPerRequest: null });
     const sub = new Redis(url, { maxRetriesPerRequest: null });
@@ -60,35 +99,12 @@ export class SyncGateway implements OnGatewayInit, OnGatewayConnection {
   }
 
   async handleConnection(client: Socket) {
-    const token =
-      (client.handshake.auth?.token as string | undefined) ??
-      (client.handshake.headers.authorization?.replace(/^Bearer\s+/i, "") as
-        | string
-        | undefined);
-
-    if (!token) {
-      this.logger.warn(`reject ${client.id}: no token`);
+    const userId = client.data.userId as string | undefined;
+    if (!userId) {
       client.disconnect(true);
       return;
     }
 
-    let userId: string | null = null;
-    if (token.startsWith("dev-")) {
-      userId = `dev:${token}`;
-    } else {
-      try {
-        const payload = this.jwt.verify<{ sub: string }>(token, {
-          secret: this.config.getOrThrow<string>("JWT_SECRET"),
-        });
-        userId = payload.sub;
-      } catch {
-        this.logger.warn(`reject ${client.id}: bad jwt`);
-        client.disconnect(true);
-        return;
-      }
-    }
-
-    client.data.userId = userId;
     await client.join(this.fanout.userRoom(userId));
 
     // dev: pseudo-users aren't real accounts — they have no UUID and no
@@ -120,6 +136,8 @@ export class SyncGateway implements OnGatewayInit, OnGatewayConnection {
         listingStatus: payload?.listingStatus as string | undefined,
         observedPuuid: payload?.observedPuuid as string | undefined,
         listingId: payload?.listingId as string | undefined,
+        partyId: payload?.partyId as string | undefined,
+        gameId: payload?.gameId as number | undefined,
       });
     }
     ack?.({ ok: true, serverStatus: (payload?.listingStatus as string) ?? undefined });
@@ -224,6 +242,44 @@ export class SyncGateway implements OnGatewayInit, OnGatewayConnection {
     this.emitAck(client, SocketEvents.SESSION_END, ListingStatus.POST_SESSION);
   }
 
+  @SubscribeMessage(SocketEvents.GAME_STARTED)
+  async onGameStarted(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: GameStartedPayload,
+    ack?: Ack
+  ) {
+    const userId = client.data.userId as string;
+    if (!userId || userId.startsWith("dev:")) {
+      ack?.({ ok: true });
+      return;
+    }
+    try {
+      await this.games.onGameStarted(userId, payload);
+      ack?.({ ok: true });
+    } catch (e) {
+      ack?.({ ok: false, error: e instanceof Error ? e.message : "fail" });
+    }
+  }
+
+  @SubscribeMessage(SocketEvents.GAME_ENDED)
+  async onGameEnded(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: GameEndedPayload,
+    ack?: Ack
+  ) {
+    const userId = client.data.userId as string;
+    if (!userId || userId.startsWith("dev:")) {
+      ack?.({ ok: true });
+      return;
+    }
+    try {
+      await this.games.onGameEnded(userId, payload);
+      ack?.({ ok: true });
+    } catch (e) {
+      ack?.({ ok: false, error: e instanceof Error ? e.message : "fail" });
+    }
+  }
+
   @SubscribeMessage(SocketEvents.LOBBY_CONFIRMED)
   async onLobbyConfirmed(
     @ConnectedSocket() client: Socket,
@@ -290,7 +346,7 @@ export class SyncGateway implements OnGatewayInit, OnGatewayConnection {
         message: msg,
       });
     } catch (e) {
-      ack?.({ ok: false, error: e instanceof Error ? e.message : "fail" });
+      ack?.({ ok: false, error: exceptionCode(e) });
     }
   }
 
@@ -301,27 +357,52 @@ export class SyncGateway implements OnGatewayInit, OnGatewayConnection {
     ack?: Ack
   ) {
     const userId = client.data.userId as string;
-    const listingId = payload?.listingId as string | undefined;
-    if (listingId && userId && !userId.startsWith("dev:")) {
-      try {
-        const mine = await this.listings.mine(userId);
-        if (mine) {
-          client.emit(SocketEvents.LISTING_STATE, {
-            listingId: mine.id,
-            status: mine.status,
-            reason: "reconcile",
-          });
-          ack?.({ ok: true, serverStatus: mine.status });
-          return;
-        }
-      } catch {
-        /* fall through */
-      }
+    if (!userId || userId.startsWith("dev:")) {
+      ack?.({
+        ok: true,
+        serverStatus: (payload?.listingStatus as string) ?? undefined,
+      });
+      return;
     }
-    ack?.({
-      ok: true,
-      serverStatus: (payload?.listingStatus as string) ?? undefined,
-    });
+
+    let serverStatus = (payload?.listingStatus as string) ?? undefined;
+    try {
+      const mine = await this.listings.mine(userId);
+      if (mine) {
+        serverStatus = mine.status;
+        client.emit(SocketEvents.LISTING_STATE, {
+          listingId: mine.id,
+          status: mine.status,
+          reason: "reconcile",
+        });
+        const pending = await this.joins.listForListing(userId, mine.id);
+        for (const row of pending) {
+          if (row.status !== "PENDING") continue;
+          client.emit(SocketEvents.JOIN_REQUESTED, {
+            joinRequestId: row.id,
+            card: row.card,
+            matchScore: row.matchScore ?? 0,
+            offRole: row.offRole,
+            roleSlot: row.roleSlot,
+            replay: true,
+          });
+        }
+      }
+    } catch (e) {
+      this.logger.warn(`reconcile listing ${userId}: ${exceptionCode(e)}`);
+    }
+
+    try {
+      const summary = await this.sessions.findActiveSummaryForUser(userId);
+      if (summary) {
+        await client.join(this.fanout.sessionRoom(summary.sessionId));
+        client.emit(SocketEvents.SESSION_ACTIVE, summary);
+      }
+    } catch (e) {
+      this.logger.warn(`reconcile session ${userId}: ${exceptionCode(e)}`);
+    }
+
+    ack?.({ ok: true, serverStatus });
   }
 
   private async handleListingEvent(
@@ -393,4 +474,14 @@ export class SyncGateway implements OnGatewayInit, OnGatewayConnection {
   private emitAck(client: Socket, event: string, serverStatus: string) {
     client.emit(SocketEvents.SYNC_ACK, { event, ok: true, serverStatus });
   }
+}
+
+function exceptionCode(e: unknown): string {
+  if (e && typeof e === "object" && "getResponse" in e) {
+    const body = (e as { getResponse: () => unknown }).getResponse();
+    if (body && typeof body === "object" && "code" in body && (body as { code?: unknown }).code) {
+      return String((body as { code: unknown }).code);
+    }
+  }
+  return e instanceof Error ? e.message : "fail";
 }
