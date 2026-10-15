@@ -3,6 +3,7 @@ import { TypeOrmModule } from "@nestjs/typeorm";
 import {
   Block,
   Endorsement,
+  GameReport,
   ReliabilityEvent,
   Report,
   RiotAccount,
@@ -24,6 +25,7 @@ import { ReputationService } from "./reputation.service";
       Session,
       RiotAccount,
       User,
+      GameReport,
     ]),
     forwardRef(() => ProfileModule),
     MetricsModule,

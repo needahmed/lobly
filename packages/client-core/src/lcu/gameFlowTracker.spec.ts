@@ -1,4 +1,4 @@
-import type { GameContext, PhaseEdge } from "@lobly/shared-types";
+import { SocketEvents, type GameContext, type PhaseEdge } from "@lobly/shared-types";
 import { GameFlowTracker } from "./gameFlowTracker";
 import { SerialQueue } from "./serialQueue";
 import { champSelect, gameflowSession, lobby } from "./__fixtures__/lcu";
@@ -114,6 +114,33 @@ describe("GameFlowTracker", () => {
     await tracker.idle();
     expect(edges.map((e) => e.to)).toEqual(["ChampSelect"]);
     expect(logs.some((l) => l.includes("stale"))).toBe(true);
+  });
+
+  it("fills a missing gameId from the end-of-game block once", async () => {
+    const sent: { event: string; payload: any }[] = [];
+    const tracker = new GameFlowTracker({
+      now: () => 5,
+      eogAttempts: 3,
+      eogDelayMs: 0,
+      send: (event, payload) => sent.push({ event, payload }),
+      fetch: async (endpoint) => {
+        if (endpoint !== "eogStatsBlock") return null;
+        return {
+          gameId: 77,
+          gameLength: 1500,
+          localPlayer: { championId: 1, stats: { CHAMPIONS_KILLED: 3, NUM_DEATHS: 1, ASSISTS: 4, WIN: 1 } },
+          teams: [{ isPlayerTeam: true, isWinningTeam: true }],
+        };
+      },
+    });
+    void tracker.ingest("gameflowSession", gameflowSession("InProgress", { gameId: 0 }));
+    void tracker.ingest("gameflowSession", gameflowSession("WaitingForStats", { gameId: 0 }));
+    void tracker.ingest("gameflowSession", gameflowSession("EndOfGame", { gameId: 0 }));
+    await tracker.idle();
+    const ended = sent.filter((row) => row.event === SocketEvents.GAME_ENDED);
+    expect(ended).toHaveLength(1);
+    expect(ended[0].payload.gameId).toBe(77);
+    expect(ended[0].payload.terminatedInError).toBe(false);
   });
 
   it("replays phases after reset (LCU reconnect)", async () => {

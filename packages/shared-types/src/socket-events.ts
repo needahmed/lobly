@@ -23,9 +23,14 @@ export const SocketEvents = {
   JOIN_DECLINED: "join.declined",
   JOIN_FAILED: "join.failed",
   JOIN_REOPENED: "join.reopened",
+  JOIN_CANCELLED: "join.cancelled",
   SESSION_ACTIVE: "session.active",
+  SESSION_ENDED: "session.ended",
   CHAT_MESSAGE: "chat.message",
   ENDORSE_PROMPT: "endorse.prompt",
+  GAME_STARTED: "game.started",
+  GAME_ENDED: "game.ended",
+  POSTGAME_READY: "postgame.ready",
   SYNC_ACK: "sync.ack",
 } as const;
 
@@ -42,6 +47,8 @@ export const C2S = {
   MEMBER_LEFT: SocketEvents.MEMBER_LEFT,
   SESSION_START: SocketEvents.SESSION_START,
   SESSION_END: SocketEvents.SESSION_END,
+  GAME_STARTED: SocketEvents.GAME_STARTED,
+  GAME_ENDED: SocketEvents.GAME_ENDED,
   CHAT_SEND: SocketEvents.CHAT_SEND,
   STATE_RECONCILE: SocketEvents.STATE_RECONCILE,
 } as const;
@@ -55,8 +62,13 @@ export const S2C = {
   JOIN_FAILED: SocketEvents.JOIN_FAILED,
   JOIN_REOPENED: SocketEvents.JOIN_REOPENED,
   SESSION_ACTIVE: SocketEvents.SESSION_ACTIVE,
+  SESSION_ENDED: SocketEvents.SESSION_ENDED,
   CHAT_MESSAGE: SocketEvents.CHAT_MESSAGE,
   ENDORSE_PROMPT: SocketEvents.ENDORSE_PROMPT,
+  JOIN_CANCELLED: SocketEvents.JOIN_CANCELLED,
+  GAME_STARTED: SocketEvents.GAME_STARTED,
+  GAME_ENDED: SocketEvents.GAME_ENDED,
+  POSTGAME_READY: SocketEvents.POSTGAME_READY,
 } as const;
 
 export type SocketEventName = (typeof SocketEvents)[keyof typeof SocketEvents];
@@ -66,6 +78,8 @@ export interface PresenceHeartbeatPayload {
   listingStatus?: string;
   observedPuuid?: string;
   listingId?: string;
+  partyId?: string;
+  gameId?: number;
 }
 
 export interface ListingStatePayload {
@@ -85,6 +99,17 @@ export interface JoinRequestedPayload {
   matchScore: number;
   offRole: boolean;
   roleSlot: string | null;
+  /** True when the server is replaying pending requests on reconnect. Do not toast. */
+  replay?: boolean;
+}
+
+export interface JoinCancelledPayload {
+  joinRequestId: string;
+}
+
+export interface JoinFailedPayload {
+  joinRequestId?: string;
+  code: string;
 }
 
 export interface JoinAcceptedToCreatorPayload {
@@ -112,6 +137,49 @@ export interface SessionActivePayload {
   sessionId: string;
   memberAccountIds: string[];
   chatOpen: boolean;
+  endedAt?: string | null;
+  chatOpenUntil?: string | null;
+}
+
+export interface SessionEndedPayload {
+  sessionId: string;
+  chatOpenUntil: string | null;
+}
+
+export interface GameStartedPayload {
+  sessionId?: string;
+  gameId: number;
+  queueId?: number;
+  partyId?: string | null;
+  memberPuuids?: string[];
+}
+
+export interface GameEndedPayload {
+  sessionId?: string;
+  gameId: number;
+  queueId?: number;
+  partyId?: string | null;
+  memberPuuids?: string[];
+  endedAt?: number;
+  terminatedInError?: boolean;
+}
+
+export interface PostgameEndorseTarget {
+  accountId: string;
+  riotId: string;
+  tagLine: string;
+  role?: string | null;
+}
+
+export interface PostgameReadyPayload {
+  gameId: number;
+  riotConfirmed: boolean;
+  profileRefreshed?: boolean;
+  sessionId?: string | null;
+  endorse?: {
+    sessionId: string;
+    others: PostgameEndorseTarget[];
+  } | null;
 }
 
 export interface ChatMessagePayload {
@@ -124,7 +192,8 @@ export interface ChatMessagePayload {
 
 export interface EndorsePromptPayload {
   sessionId: string;
-  others: { accountId: string; riotId: string; tagLine: string }[];
+  gameId?: number;
+  others: { accountId: string; riotId: string; tagLine: string; role?: string | null }[];
 }
 
 export interface StateReconcilePayload {

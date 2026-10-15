@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { MatchHistoryRow, ProfileCard } from "@lobly/shared-types";
-import { fetchMatchHistory, fetchMyProfiles, updatePrefs } from "../api/session";
+import { fetchMatchHistory, fetchMyProfiles } from "../api/session";
 import { getBridge } from "../shared/bridge";
 import { useAppStore } from "../shared/messaging";
 import { c, radius, font, tierColor } from "./theme";
@@ -395,53 +395,10 @@ function QueueRank({
 }
 
 function PrefsCard({ card }: { card: ProfileCard }) {
-  const [autoAccept, setAutoAccept] = useState(
-    card.prefs?.autoAcceptLoblyInvites ?? false
-  );
-  const [saving, setSaving] = useState(false);
-
+  if (!card.reputation) return null;
   return (
     <Card>
-      <SectionTitle>Settings</SectionTitle>
-      <label
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 10,
-          cursor: "pointer",
-          color: c.textDim,
-        }}
-      >
-        <input
-          type="checkbox"
-          checked={autoAccept}
-          disabled={saving}
-          onChange={async (e) => {
-            const v = e.target.checked;
-            setAutoAccept(v);
-            setSaving(true);
-            getBridge()?.store.update({ autoAcceptLoblyInvites: v });
-            try {
-              await updatePrefs({ autoAcceptLoblyInvites: v });
-            } catch (err: any) {
-              setAutoAccept(!v);
-              getBridge()?.setToast(err?.message ?? "Couldn't save setting");
-            } finally {
-              setSaving(false);
-            }
-          }}
-          style={{ width: 16, height: 16, accentColor: c.primary }}
-        />
-        <span>
-          <span style={{ color: c.text, fontWeight: 600 }}>
-            Auto-accept LOBLY invites
-          </span>
-          <br />
-          <span style={{ fontSize: 11 }}>
-            When a creator accepts you, join their League lobby automatically.
-          </span>
-        </span>
-      </label>
+      <SectionTitle>Reputation</SectionTitle>
       {card.reputation && (
         <div
           style={{

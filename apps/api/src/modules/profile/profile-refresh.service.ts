@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, OnModuleInit } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { InjectRepository } from "@nestjs/typeorm";
 import { In, Repository } from "typeorm";
@@ -18,13 +18,41 @@ import {
   computeRoles,
   kdaString,
 } from "./profile-compute";
+import { DEFAULT_SEASON_START_EPOCH, resolveSeason } from "./season-config";
 
 const MAX_NEW_MATCHES = 30;
-const CURRENT_SEASON = "2026";
+
+/** Thrown when a just-played match is not in the match-v5 id list yet. */
+export class MatchNotReadyError extends Error {
+  constructor(matchId: string) {
+    super(`retryable: match ${matchId} not in list yet`);
+    this.name = "MatchNotReadyError";
+  }
+}
 
 @Injectable()
-export class ProfileRefreshService {
+export class ProfileRefreshService implements OnModuleInit {
   private readonly logger = new Logger(ProfileRefreshService.name);
+  private seasonEpoch = DEFAULT_SEASON_START_EPOCH;
+  private currentSeason = String(
+    new Date(DEFAULT_SEASON_START_EPOCH * 1000).getUTCFullYear()
+  );
+
+  onModuleInit(): void {
+    const resolved = this.applySeasonConfig();
+    if (resolved.unset.length) {
+      this.logger.warn(
+        `Season env unset (${resolved.unset.join(", ")}); using epoch ${resolved.epoch} and season "${resolved.season}"`
+      );
+    }
+  }
+
+  private applySeasonConfig() {
+    const resolved = resolveSeason(this.config);
+    this.seasonEpoch = resolved.epoch;
+    this.currentSeason = resolved.season;
+    return resolved;
+  }
 
   constructor(
     @InjectRepository(RiotAccount) private readonly accounts: Repository<RiotAccount>,
@@ -38,7 +66,11 @@ export class ProfileRefreshService {
     private readonly config: ConfigService
   ) {}
 
-  async refresh(riotAccountId: string): Promise<void> {
+  async refresh(
+    riotAccountId: string,
+    opts?: { mustIncludeMatchId?: string }
+  ): Promise<void> {
+    this.applySeasonConfig();
     const account = await this.accounts.findOne({ where: { id: riotAccountId } });
     if (!account) {
       this.logger.warn(`account missing ${riotAccountId}`);
@@ -56,11 +88,15 @@ export class ProfileRefreshService {
     const solo = entries.find((e) => e.queueType === "RANKED_SOLO_5x5");
     const flex = entries.find((e) => e.queueType === "RANKED_FLEX_SR");
 
-    const seasonStart = Number(this.config.get("SEASON_START_EPOCH") ?? 1743465600);
+    const seasonStart = this.seasonEpoch;
     const matchIds = await this.riot.client.matchIdsByPuuid(region, puuid, {
       startTime: seasonStart,
       count: 100,
     });
+
+    if (opts?.mustIncludeMatchId && !matchIds.includes(opts.mustIncludeMatchId)) {
+      throw new MatchNotReadyError(opts.mustIncludeMatchId);
+    }
 
     const seenRows = matchIds.length
       ? await this.matchesSeen.find({
@@ -91,19 +127,33 @@ export class ProfileRefreshService {
       }
     }
 
-    // Fill role/form window with up to 60 recent match details
+    // Fill the role/form window from rows we already stored. Riot is only
+    // called for ids that are not in `seen`.
     const needDetail = Math.min(60, matchIds.length);
-    for (const matchId of matchIds.slice(0, needDetail)) {
+    const windowIds = matchIds.slice(0, needDetail);
+    const storedIds = windowIds.filter((id) => seen.has(id) && !fetched.has(id));
+    const storedRows = storedIds.length
+      ? await this.matches.find({ where: { matchId: In(storedIds) } })
+      : [];
+    const storedById = new Map(storedRows.map((row) => [row.matchId, row]));
+
+    for (const matchId of windowIds) {
       if (fetched.has(matchId)) continue;
+      if (seen.has(matchId)) {
+        const row = storedById.get(matchId);
+        if (row) {
+          allMatches.push(storedMatchToDto(row));
+          fetched.add(matchId);
+        }
+        continue;
+      }
       try {
         const m = await this.riot.client.matchById(region, matchId);
         allMatches.push(m);
         fetched.add(matchId);
-        if (!seen.has(matchId)) {
-          await this.matchesSeen.save(
-            this.matchesSeen.create({ riotAccountId, matchId })
-          );
-        }
+        await this.matchesSeen.save(
+          this.matchesSeen.create({ riotAccountId, matchId })
+        );
       } catch (e) {
         this.logger.warn(`failed detail ${matchId}: ${String(e)}`);
       }
@@ -144,13 +194,13 @@ export class ProfileRefreshService {
       })
     );
 
-    await this.champStats.delete({ riotAccountId, season: CURRENT_SEASON });
+    await this.champStats.delete({ riotAccountId, season: this.currentSeason });
     for (const c of champs) {
       await this.champStats.save(
         this.champStats.create({
           riotAccountId,
           championId: c.championId,
-          season: CURRENT_SEASON,
+          season: this.currentSeason,
           games: c.games,
           wins: c.wins,
           kda: kdaString(c.kills, c.deaths, c.assists),
@@ -225,6 +275,29 @@ export class ProfileRefreshService {
       }
     }
   }
+}
+
+function storedMatchToDto(row: Match): MatchDto {
+  const participants = row.participants ?? [];
+  const gameCreation =
+    row.gameCreation instanceof Date
+      ? row.gameCreation.getTime()
+      : new Date(row.gameCreation).getTime();
+  return {
+    metadata: {
+      matchId: row.matchId,
+      participants: participants.map((p) => p.puuid).filter((id) => !!id),
+    },
+    info: {
+      gameId: 0,
+      queueId: row.queueId,
+      gameCreation,
+      gameDuration: row.gameDuration,
+      gameMode: row.gameMode ?? undefined,
+      gameVersion: row.gameVersion ?? undefined,
+      participants,
+    },
+  };
 }
 
 function itemsOf(p: MatchParticipant): number[] {

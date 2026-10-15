@@ -13,6 +13,7 @@ import {
   rankToInt,
 } from "@lobly/shared-types";
 import {
+  JoinRequest,
   Listing,
   ProfileSnapshot,
   RiotAccount,
@@ -40,6 +41,7 @@ function parseRankBound(raw?: string): number | null {
 export class BoardService {
   constructor(
     @InjectRepository(Listing) private readonly listings: Repository<Listing>,
+    @InjectRepository(JoinRequest) private readonly joinRequests: Repository<JoinRequest>,
     @InjectRepository(RiotAccount) private readonly accounts: Repository<RiotAccount>,
     @InjectRepository(ProfileSnapshot) private readonly snapshots: Repository<ProfileSnapshot>,
     @InjectRepository(UserPrefsEntity) private readonly prefsRepo: Repository<UserPrefsEntity>,
@@ -127,6 +129,11 @@ export class BoardService {
         }
       }
     }
+
+    const myRequestByListing = await this.loadMyRequests(
+      userId,
+      candidates.map((c) => c.id)
+    );
 
     const creatorIds = [...new Set(candidates.map((c) => c.creatorAccountId))];
     const creators = creatorIds.length
@@ -287,6 +294,7 @@ export class BoardService {
         provisional: creatorRep?.provisional ?? elig.provisional,
         reliability: creatorRep?.reliability ?? null,
         isOwn,
+        myRequest: myRequestByListing.get(listing.id) ?? null,
       });
     }
 
@@ -311,6 +319,32 @@ export class BoardService {
     });
 
     return rows.slice(0, 50);
+  }
+
+  private async loadMyRequests(
+    userId: string,
+    listingIds: string[]
+  ): Promise<Map<string, { id: string; status: string }>> {
+    const map = new Map<string, { id: string; status: string }>();
+    if (!listingIds.length) return map;
+    const mine = await this.accounts.find({ where: { userId } });
+    const accountIds = mine.map((a) => a.id);
+    if (!accountIds.length) return map;
+    const rows = await this.joinRequests.find({
+      where: {
+        listingId: In(listingIds),
+        requesterAccountId: In(accountIds),
+        status: In(["PENDING", "ACCEPTED"]),
+      },
+      order: { createdAt: "DESC" },
+    });
+    for (const row of rows) {
+      const prev = map.get(row.listingId);
+      if (!prev || (row.status === "ACCEPTED" && prev.status !== "ACCEPTED")) {
+        map.set(row.listingId, { id: row.id, status: row.status });
+      }
+    }
+    return map;
   }
 
   private async resolveViewerAccount(

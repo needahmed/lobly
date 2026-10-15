@@ -25,6 +25,16 @@ export interface LoblyBridge {
   sendChat?: (sessionId: string, body: string) => void;
   acceptJoin?: (joinRequestId: string) => Promise<void>;
   declineJoin?: (joinRequestId: string) => Promise<void>;
+  /** Switch the in-app tab. Implemented by writing `uiTab` on the store. */
+  navigate?: (tab: string) => void;
+  /** Host push (notification click, second instance). */
+  onNavigate?: (cb: (tab: string) => void) => () => void;
+  /** Runs in the process that owns the LCU and the socket. */
+  riotSignIn?: () => Promise<void>;
+  linkAnotherAccount?: () => Promise<void>;
+  devSignIn?: (email: string, password: string) => Promise<void>;
+  signOut?: () => Promise<void>;
+  setOpenAtLogin?: (open: boolean) => void;
   /** Present only in Electron, where the shared shell owns the title bar. */
   windowControls?: WindowControls;
   spike?: {

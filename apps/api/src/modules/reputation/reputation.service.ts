@@ -1,16 +1,19 @@
 import {
   BadRequestException,
   ForbiddenException,
+  Inject,
   Injectable,
   NotFoundException,
+  Optional,
+  forwardRef,
 } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
-import { Inject, forwardRef } from "@nestjs/common";
 import { MoreThan, Repository } from "typeorm";
 import type { EndorseKind, ReportReason } from "@lobly/shared-types";
 import {
   Block,
   Endorsement,
+  GameReport,
   ReliabilityEvent,
   Report,
   RiotAccount,
@@ -39,7 +42,10 @@ export class ReputationService {
     @InjectRepository(User) private readonly users: Repository<User>,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     @Inject(forwardRef(() => ProfileService))
-    private readonly profiles: ProfileService
+    private readonly profiles: ProfileService,
+    @Optional()
+    @InjectRepository(GameReport)
+    private readonly gameReports?: Repository<GameReport>
   ) {}
 
   async recordEvent(
@@ -88,8 +94,17 @@ export class ReputationService {
     const rows = await this.endorsements.find({
       where: { toAccountId: accountId },
     });
+    // Each (from, calendar day) counts once per kind, so a duo cannot farm
+    // the same chip across several games in one day.
     const counts = { goodComms: 0, goodTeammate: 0, skilled: 0 };
+    const seen = new Set<string>();
     for (const r of rows) {
+      const day = (r.createdAt instanceof Date ? r.createdAt : new Date(r.createdAt))
+        .toISOString()
+        .slice(0, 10);
+      const key = `${r.kind}|${r.fromAccountId}|${day}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
       if (r.kind === "GOOD_COMMS") counts.goodComms++;
       else if (r.kind === "GOOD_TEAMMATE") counts.goodTeammate++;
       else if (r.kind === "SKILLED") counts.skilled++;
@@ -183,20 +198,18 @@ export class ReputationService {
     userId: string,
     sessionId: string,
     toAccountId: string,
-    kinds: EndorseKind[]
+    kinds: EndorseKind[],
+    gameId?: number
   ) {
     const session = await this.sessions.findOne({ where: { id: sessionId } });
     if (!session) throw new NotFoundException({ code: "NOT_FOUND" });
-    if (!session.endedAt) {
-      throw new BadRequestException({ code: "SESSION_NOT_ENDED" });
-    }
-    if (Date.now() - session.endedAt.getTime() > 24 * 60 * 60 * 1000) {
-      throw new BadRequestException({ code: "ENDORSE_WINDOW_CLOSED" });
-    }
 
+    const verified = (session.riotVerifiedGameIds ?? [])
+      .map((id) => Number(id))
+      .filter((id) => Number.isFinite(id) && id > 0);
     const mine = await this.accounts.find({ where: { userId } });
     const from = mine.find((a) => session.memberAccountIds.includes(a.id));
-    if (!from) throw new ForbiddenException({ code: "NOT_MEMBER" });
+    if (!from) throw new BadRequestException({ code: "NOT_SESSION_MEMBER" });
     if (from.id === toAccountId) {
       throw new BadRequestException({ code: "CANNOT_ENDORSE_SELF" });
     }
@@ -204,20 +217,53 @@ export class ReputationService {
       throw new BadRequestException({ code: "NOT_SESSION_MEMBER" });
     }
 
+    const game = gameId ?? verified[verified.length - 1];
+    if (!game || !verified.includes(game)) {
+      throw new BadRequestException({ code: "GAME_NOT_VERIFIED" });
+    }
+
+    let confirmedAt = 0;
+    if (this.gameReports) {
+      const report = await this.gameReports.findOne({
+        where: { sessionId, gameId: String(game) },
+      });
+      confirmedAt = report?.riotConfirmedAt?.getTime() ?? 0;
+    }
+    const endedAt = session.endedAt?.getTime() ?? 0;
+    if (endedAt || confirmedAt) {
+      const anchor = Math.max(endedAt, confirmedAt);
+      if (Date.now() - anchor > 24 * 60 * 60 * 1000) {
+        throw new BadRequestException({ code: "ENDORSE_WINDOW_CLOSED" });
+      }
+    } else if (!verified.length) {
+      throw new BadRequestException({ code: "SESSION_NOT_ENDED" });
+    }
+
     const allowed: EndorseKind[] = ["GOOD_COMMS", "GOOD_TEAMMATE", "SKILLED"];
     for (const kind of kinds) {
       if (!allowed.includes(kind)) continue;
+      const existing = await this.endorsements.findOne({
+        where: {
+          sessionId,
+          gameId: String(game),
+          fromAccountId: from.id,
+          toAccountId,
+          kind,
+        },
+      });
+      if (existing) continue;
       try {
         await this.endorsements.save(
           this.endorsements.create({
             sessionId,
+            gameId: String(game),
             fromAccountId: from.id,
             toAccountId,
             kind,
           })
         );
       } catch {
-        /* PK duplicate — ignore */
+        /* unique violation — replayed endorse is a no-op */
       }
     }
     return { ok: true };
@@ -232,12 +278,30 @@ export class ReputationService {
       detail?: string;
     }
   ) {
+    const target = await this.accounts.findOne({
+      where: { id: body.accountId },
+    });
+    if (!target) throw new BadRequestException({ code: "NOT_FOUND" });
+
+    const mine = await this.accounts.find({ where: { userId } });
+    if (mine.some((m) => m.id === body.accountId)) {
+      throw new BadRequestException({ code: "CANNOT_REPORT_SELF" });
+    }
+    if (body.sessionId) {
+      const session = await this.sessions.findOne({
+        where: { id: body.sessionId },
+      });
+      const isMember =
+        !!session &&
+        mine.some((m) => session.memberAccountIds.includes(m.id));
+      if (!isMember) throw new BadRequestException({ code: "NOT_MEMBER" });
+    }
+
     const dayKey = `reports:${userId}:${new Date().toISOString().slice(0, 10)}`;
     const count = await this.redis.incr(dayKey);
     if (count === 1) await this.redis.expire(dayKey, 86400);
     if (count > 10) throw new BadRequestException({ code: "REPORT_CAP" });
 
-    const mine = await this.accounts.find({ where: { userId } });
     const reporter = mine[0] ?? null;
     const row = await this.reports.save(
       this.reports.create({

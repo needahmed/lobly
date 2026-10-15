@@ -17,6 +17,19 @@ export async function restoreWindow(name: string) {
   await owCall((cb) => overwolf.windows.restore(id, cb));
 }
 
+/** Show a window without grabbing focus from the League client. */
+export async function showWindowBehind(name: string) {
+  const id = await obtainWindow(name);
+  const windows = overwolf.windows as typeof overwolf.windows & {
+    bringToFront?: (windowId: string, grabFocus: boolean, cb: (res: unknown) => void) => void;
+  };
+  if (typeof windows.bringToFront === "function") {
+    await owCall((cb) => windows.bringToFront!(id, false, cb));
+    return;
+  }
+  await owCall((cb) => overwolf.windows.restore(id, cb));
+}
+
 export async function hideWindow(name: string) {
   const id = await obtainWindow(name);
   await owCall((cb) => overwolf.windows.hide(id, cb));

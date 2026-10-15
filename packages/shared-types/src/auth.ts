@@ -1,6 +1,7 @@
 export interface AuthUser {
   id: string;
-  email: string;
+  /** Null when the account was created by Riot sign-in and has no email login. */
+  email: string | null;
   createdAt: string;
 }
 

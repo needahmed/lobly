@@ -49,6 +49,31 @@ export function getAccessToken(): string | null {
   return accessToken;
 }
 
+export function getRefreshToken(): string | null {
+  return refreshToken;
+}
+
+/** Wraps the private refresh used by 401 retries. True when new tokens were stored. */
+export async function refreshAccessToken(): Promise<boolean> {
+  if (!refreshToken) loadStoredAuth();
+  return tryRefresh();
+}
+
+export async function logoutRemote(): Promise<void> {
+  const token = refreshToken;
+  if (!token) return;
+  try {
+    const backendUrl = getHostAdapter().backendUrl;
+    await fetch(`${backendUrl}/v1/auth/logout`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken: token }),
+    });
+  } catch {
+    /* local clear still happens */
+  }
+}
+
 /**
  * Supplies the access token from somewhere other than this module's own
  * state. Needed by UI-only JS contexts that never log in themselves: an

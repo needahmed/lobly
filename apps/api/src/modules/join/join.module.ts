@@ -14,8 +14,10 @@ import { ReputationModule } from "../reputation/reputation.module";
 import { MetricsModule } from "../metrics/metrics.module";
 import { SessionModule } from "../session/session.module";
 import { JoinController } from "./join.controller";
-import { JOIN_QUEUE, JoinService } from "./join.service";
+import { JOIN_QUEUE } from "./join.constants";
+import { JoinService } from "./join.service";
 import { JoinProcessor } from "./join.processor";
+import { JoinCleanupService } from "./join-cleanup.service";
 
 @Module({
   imports: [
@@ -29,7 +31,7 @@ import { JoinProcessor } from "./join.processor";
     forwardRef(() => SessionModule),
   ],
   controllers: [JoinController],
-  providers: [JoinService, JoinProcessor],
-  exports: [JoinService],
+  providers: [JoinService, JoinProcessor, JoinCleanupService],
+  exports: [JoinService, JoinCleanupService],
 })
 export class JoinModule {}

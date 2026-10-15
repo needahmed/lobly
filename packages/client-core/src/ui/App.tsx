@@ -7,10 +7,12 @@ import { Avatar, BrandMark, IconButton, Tag } from "./components";
 import { ProfileView } from "./ProfileView";
 import { BoardView } from "./BoardView";
 import { ListingView, RequestsView, SessionView } from "./LobbyViews";
-import { DebugView } from "./DebugView";
+import { SettingsView } from "./SettingsView";
+import { SignInGate } from "./SignInGate";
+import { PostGameBanner, PostGameView } from "./PostGameView";
 import { profileIcon, useStaticData } from "./useStaticData";
 
-type Tab = "board" | "listing" | "requests" | "session" | "profile" | "debug";
+type Tab = "board" | "listing" | "requests" | "session" | "profile" | "settings" | "postgame";
 
 const NAV: {
   id: Exclude<Tab, "debug">;
@@ -60,16 +62,47 @@ export function App() {
   const state = useAppStore();
   const bridge = getBridge();
   const sd = useStaticData();
-  const [tab, setTab] = useState<Tab>("profile");
-  const pending = state.pendingRequests?.length ?? 0;
+  const tab = (isTab(state.uiTab) ? state.uiTab : "profile") as Tab;
+  const setTab = (next: Tab) => {
+    if (bridge?.navigate) bridge.navigate(next);
+    else bridge?.store.update({ uiTab: next });
+  };
+  const pending = (state.pendingRequests?.length ?? 0) + (state.outgoingRequests?.length ?? 0);
+  const [syncDownMs, setSyncDownMs] = useState(0);
   const windowControls = bridge?.windowControls;
   const activeMeta =
-    NAV.find((n) => n.id === tab) ??
-    ({
-      label: "Diagnostics",
-      eyebrow: "System Console",
-      description: "Inspect connectivity, events and integration health.",
-    } as const);
+    tab === "postgame"
+      ? {
+          label: "Post-game",
+          eyebrow: "Match Recap",
+          description: "Review the game you just played and endorse your teammates.",
+        }
+      : (NAV.find((n) => n.id === tab) ??
+        ({
+          label: "Settings",
+          eyebrow: "Preferences",
+          description: "Matchmaking, accounts, privacy and diagnostics.",
+        } as const));
+
+  useEffect(() => {
+    return bridge?.onNavigate?.((next) => {
+      if (isTab(next)) bridge.store.update({ uiTab: next });
+    });
+  }, [bridge]);
+
+  useEffect(() => {
+    if (state.sync.connected) {
+      setSyncDownMs(0);
+      return;
+    }
+    const started = Date.now();
+    const id = window.setInterval(() => setSyncDownMs(Date.now() - started), 500);
+    return () => window.clearInterval(id);
+  }, [state.sync.connected]);
+
+  const needsGate =
+    state.authChecked &&
+    (state.authExpired || state.accountMismatch || (!state.authenticated && !state.hasStoredSession));
 
   // One global stylesheet for the whole app (resets, scrollbars, keyframes).
   useEffect(() => {
@@ -160,15 +193,15 @@ export function App() {
             />
             <button
               className="lobly-nav-button"
-              onClick={() => setTab("debug")}
-              title="Settings & diagnostics"
+              onClick={() => setTab("settings")}
+              title="Settings"
               style={{
                 width: "100%",
                 minHeight: 48,
                 border: "1px solid transparent",
-                background: tab === "debug" ? c.primarySoft : "transparent",
+                background: tab === "settings" ? c.primarySoft : "transparent",
                 borderRadius: radius.lg,
-                color: tab === "debug" ? c.primary : c.textFaint,
+                color: tab === "settings" ? c.primary : c.textFaint,
                 display: "grid",
                 placeItems: "center",
               }}
@@ -179,7 +212,7 @@ export function App() {
             </button>
             {state.summoner && (
               <div title={`${state.summoner.gameName}#${state.summoner.tagLine}`}>
-                <Avatar url={profileIcon(sd, (state.summoner as any).profileIconId)} size={40} />
+                <Avatar url={profileIcon(sd, state.summoner.profileIconId)} size={40} />
               </div>
             )}
           </div>
@@ -237,17 +270,47 @@ export function App() {
             </div>
           </header>
 
+          {(state.apiUnreachable || (state.authenticated && !state.sync.connected && syncDownMs > 5000)) && (
+            <div
+              style={{
+                background: c.warn,
+                color: "#1a1206",
+                textAlign: "center",
+                fontSize: 12,
+                fontWeight: 700,
+                padding: "6px 12px",
+              }}
+            >
+              {state.apiUnreachable
+                ? "Can't reach LOBLY servers — retrying"
+                : "Reconnecting to LOBLY…"}
+            </div>
+          )}
+
+          <PostGameBanner />
           <main
             className="lobly-page lobly-page-grid"
             style={{ flex: 1, overflowY: "auto", padding: 28, position: "relative" }}
           >
             <div className="lobly-fade" key={tab} style={{ maxWidth: 1240, margin: "0 auto" }}>
-              {tab === "board" && <BoardView />}
-              {tab === "listing" && <ListingView state={state} bridge={bridge} />}
-              {tab === "requests" && <RequestsView state={state} />}
-              {tab === "session" && <SessionView state={state} bridge={bridge} />}
-              {tab === "profile" && <ProfileView />}
-              {tab === "debug" && <DebugView state={state} bridge={bridge} />}
+              {needsGate ? (
+                <SignInGate state={state} />
+              ) : (
+                <>
+                  {tab === "postgame" ? (
+                    <PostGameView />
+                  ) : (
+                    <>
+                      {tab === "board" && <BoardView />}
+                      {tab === "listing" && <ListingView state={state} bridge={bridge} />}
+                      {tab === "requests" && <RequestsView state={state} />}
+                      {tab === "session" && <SessionView state={state} bridge={bridge} />}
+                      {tab === "profile" && <ProfileView />}
+                      {tab === "settings" && <SettingsView state={state} bridge={bridge} />}
+                    </>
+                  )}
+                </>
+              )}
             </div>
           </main>
         </div>
@@ -259,6 +322,18 @@ export function App() {
 }
 
 /* --------------------------------------------------------- shell widgets */
+
+function isTab(value: string | undefined): value is Tab {
+  return (
+    value === "board" ||
+    value === "listing" ||
+    value === "requests" ||
+    value === "session" ||
+    value === "profile" ||
+    value === "settings" ||
+    value === "postgame"
+  );
+}
 
 function NavButton({
   label,

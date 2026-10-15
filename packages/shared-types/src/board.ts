@@ -16,6 +16,11 @@ export interface ListingSlot {
   open: boolean;
   pendingAccountId?: string | null;
   /**
+   * Why a slot was closed. Reopen only `LOBBY_FULL` from the seat reconciler.
+   * `FILLED_IN_CLIENT` is set by party sync (M2).
+   */
+  closedReason?: "LOBBY_FULL" | "OWNER" | "FILLED" | "FILLED_IN_CLIENT";
+  /**
    * @deprecated Legacy single-role field. Prefer `roles`.
    * Kept optional so old JSONB rows still parse; use normalizeSlot().
    */
@@ -63,6 +68,20 @@ export interface ListingStateBody {
   phase?: string;
 }
 
+/** Party snapshot stored on the listing. Riot IDs only for LOBLY users. */
+export interface ListingPartyMember {
+  accountId: string | null;
+  riotId: string | null;
+  roles: Role[];
+  isLeader: boolean;
+}
+
+export interface ListingParty {
+  partyId?: string | null;
+  members: ListingPartyMember[];
+  updatedAt: string;
+}
+
 export interface ListingSummary {
   id: string;
   creatorAccountId: string;
@@ -79,6 +98,7 @@ export interface ListingSummary {
   expiresAt: string;
   createdAt: string;
   queueMeta?: ListingQueueMeta | null;
+  party?: ListingParty | null;
 }
 
 export interface BoardCreatorCard {
@@ -104,6 +124,8 @@ export interface BoardRow {
   reliability?: number | null;
   /** Present when this row is the viewer's own listing. */
   isOwn?: boolean;
+  /** Viewer's own PENDING or ACCEPTED request against this listing, if any. */
+  myRequest?: { id: string; status: string } | null;
 }
 
 export type BoardSort = "score" | "newest" | "rank";
@@ -139,6 +161,7 @@ export function normalizeSlot(raw: unknown, index = 0): ListingSlot {
     roles,
     open: Boolean(s.open),
     pendingAccountId: s.pendingAccountId ?? null,
+    ...(s.closedReason ? { closedReason: s.closedReason } : {}),
   };
 }
 

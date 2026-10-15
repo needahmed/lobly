@@ -14,11 +14,13 @@ export class User {
   @PrimaryGeneratedColumn("uuid")
   id!: string;
 
-  @Column({ type: "text", unique: true })
-  email!: string;
+  /** Null for Riot-only accounts created by the icon challenge (no email login). */
+  @Column({ type: "text", unique: true, nullable: true })
+  email!: string | null;
 
-  @Column({ name: "password_hash", type: "text" })
-  passwordHash!: string;
+  /** Null for Riot-only accounts. Login must reject these instead of hashing null. */
+  @Column({ name: "password_hash", type: "text", nullable: true })
+  passwordHash!: string | null;
 
   @Column({ type: "boolean", default: false })
   banned!: boolean;

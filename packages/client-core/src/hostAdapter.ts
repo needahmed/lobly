@@ -37,6 +37,23 @@ export interface HostAdapter {
   /** Best-effort: is the main UI window hidden/minimized right now? Used to
    *  decide whether an incoming chat message also needs a toast. */
   isDesktopHidden(): Promise<boolean>;
+  /** Dev email login is compiled in only when the host's flag is on. */
+  isDevAuthEnabled?: () => boolean;
+  /**
+   * Show the main window without stealing focus. Electron uses
+   * showInactive(); Overwolf shows the window behind the League client.
+   * The decision to call this lives in client-core (once per game, setting on).
+   */
+  showWindowInactive?: () => void;
+  /** Desktop notification. Hosts no-op when the window is focused, except
+   *  where the caller already decided (chat). */
+  notify?: (
+    title: string,
+    body: string,
+    opts?: { actions?: { id: string; label: string }[]; tab?: string }
+  ) => void;
+  /** Electron "Start with Windows". Absent on hosts that cannot set it. */
+  setOpenAtLogin?: (open: boolean) => void;
 }
 
 let adapter: HostAdapter | null = null;

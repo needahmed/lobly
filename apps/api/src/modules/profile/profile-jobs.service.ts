@@ -16,13 +16,16 @@ export class ProfileJobsService {
 
   async enqueueRefresh(riotAccountId: string, priority: RefreshPriority): Promise<void> {
     const queue = priority === "interactive" ? this.interactive : this.background;
+    // BullMQ 5 keeps a completed job under its jobId until it is removed, and
+    // add() is a no-op while that id exists. `true` deletes it immediately so
+    // the next refresh for this account is actually enqueued.
     await queue.add(
       "profile.refresh",
       { riotAccountId },
       {
         jobId: `refresh:${priority}:${riotAccountId}`,
-        removeOnComplete: 100,
-        removeOnFail: 50,
+        removeOnComplete: true,
+        removeOnFail: true,
         attempts: 5,
         backoff: { type: "exponential", delay: 2000 },
       }

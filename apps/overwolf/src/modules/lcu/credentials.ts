@@ -1,5 +1,5 @@
 import type { LcuCredentials } from "@lobly/shared-types";
-import { appStore, redactPuuid } from "@lobly/client-core";
+import { appStore, noteSummonerSwitch, redactPuuid } from "@lobly/client-core";
 import { lcuRequest } from "./request";
 import { isLeagueLauncherId, owCall } from "../../shared/ow";
 
@@ -88,13 +88,17 @@ async function verifySummoner() {
     } catch {
       /* keep previous/unknown — link endpoint rejects this cleanly */
     }
+    const gameName = s.gameName ?? s.displayName?.split("#")[0] ?? "";
+    const tagLine = s.tagLine ?? "";
+    await noteSummonerSwitch({ puuid: s.puuid, gameName, tagLine });
     appStore.update({
       summoner: {
         puuid: s.puuid,
-        gameName: s.gameName ?? s.displayName?.split("#")[0] ?? "",
-        tagLine: s.tagLine ?? "",
+        gameName,
+        tagLine,
         summonerId: Number(s.summonerId),
         platform,
+        profileIconId: typeof s.profileIconId === "number" ? s.profileIconId : undefined,
       },
     });
     appStore.logLine(

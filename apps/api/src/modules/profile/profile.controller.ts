@@ -17,8 +17,11 @@ export class ProfileController {
   }
 
   @Get("profiles/:riotAccountId")
-  one(@Param("riotAccountId", ParseUUIDPipe) riotAccountId: string) {
-    return this.profiles.getCard(riotAccountId);
+  one(
+    @CurrentUser() user: JwtPayload,
+    @Param("riotAccountId", ParseUUIDPipe) riotAccountId: string
+  ) {
+    return this.profiles.getCard(riotAccountId, user.sub);
   }
 
   @Get("profiles/:riotAccountId/matches")

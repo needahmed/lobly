@@ -3,6 +3,7 @@ import { BullModule } from "@nestjs/bullmq";
 import { TypeOrmModule } from "@nestjs/typeorm";
 import {
   ChampionStat,
+  JoinRequest,
   Listing,
   ProfileSnapshot,
   RiotAccount,
@@ -14,6 +15,7 @@ import { RealtimeModule } from "../realtime/realtime.module";
 import { MetricsModule } from "../metrics/metrics.module";
 import { ReputationModule } from "../reputation/reputation.module";
 import { ConfigApiModule } from "../config/config-api.module";
+import { JoinModule } from "../join/join.module";
 import { BoardCacheService } from "./board-cache.service";
 import { BoardController } from "./board.controller";
 import { BoardService } from "./board.service";
@@ -26,6 +28,7 @@ import { SweepersProcessor } from "./sweepers.processor";
   imports: [
     TypeOrmModule.forFeature([
       Listing,
+      JoinRequest,
       RiotAccount,
       ProfileSnapshot,
       UserPrefs,
@@ -38,6 +41,7 @@ import { SweepersProcessor } from "./sweepers.processor";
     ConfigApiModule,
     forwardRef(() => ReputationModule),
     forwardRef(() => RealtimeModule),
+    forwardRef(() => JoinModule),
   ],
   controllers: [ListingsController, BoardController],
   providers: [

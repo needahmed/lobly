@@ -5,6 +5,7 @@ import {
   isPublishableQueue,
   type GameflowPhase,
   type LobbyCapability,
+  type PartyState,
 } from "@lobly/shared-types";
 import { appStore } from "./store";
 import { syncAgent } from "../sync/syncAgent";
@@ -31,6 +32,9 @@ export type MachineEvent =
   | { type: "SLOT_REOPENED" }
   | { type: "EXPIRED" }
   | { type: "QUEUE_AGAIN" };
+
+/** Final SESSION_END (Lobby/None) is sent once per session. */
+let finalSessionEndSent = false;
 
 function status(): ListingStatus {
   return appStore.state.listing.status;
@@ -92,7 +96,7 @@ async function publishViaApi(): Promise<string | undefined> {
 
     const body = draftToCreateBody(draft, cap, accountId);
     const listing = await createListing(body);
-    appStore.update({ myListing: listing, publishReason: null });
+    appStore.update({ myListing: listing, publishReason: null, queueDrift: false });
     return listing.id;
   } catch (e: any) {
     const msg = e?.body?.message ?? e?.message ?? "Publish failed";
@@ -266,6 +270,7 @@ export function dispatchMachine(event: MachineEvent) {
         event.type === "PHASE" &&
         (event.phase === "Matchmaking" || event.phase === "ChampSelect")
       ) {
+        finalSessionEndSent = false;
         setStatus(ListingStatus.IN_SESSION);
         sync(SocketEvents.SESSION_START);
       }
@@ -288,15 +293,32 @@ export function dispatchMachine(event: MachineEvent) {
         (event.phase === "EndOfGame" || event.phase === "Lobby" || event.phase === "None")
       ) {
         setStatus(ListingStatus.POST_SESSION);
-        sync(SocketEvents.SESSION_END);
+        sync(SocketEvents.SESSION_END, {
+          listingId: appStore.state.listing.id,
+          observedPhase: event.phase,
+          final: event.phase === "Lobby" || event.phase === "None",
+        });
       }
       break;
     }
     case ListingStatus.POST_SESSION: {
-      if (event.type === "QUEUE_AGAIN") {
+      if (
+        event.type === "PHASE" &&
+        (event.phase === "Lobby" || event.phase === "None") &&
+        !finalSessionEndSent
+      ) {
+        finalSessionEndSent = true;
+        sync(SocketEvents.SESSION_END, {
+          listingId: appStore.state.listing.id,
+          observedPhase: event.phase,
+          final: true,
+        });
+      } else if (event.type === "QUEUE_AGAIN") {
+        finalSessionEndSent = false;
         setStatus(ListingStatus.LISTED);
         sync(SocketEvents.LISTING_RELIST);
       } else if (event.type === "EXPIRED") {
+        finalSessionEndSent = false;
         setStatus(ListingStatus.DELISTED);
         sync(SocketEvents.LISTING_DELIST);
         appStore.update({ myListing: null });
@@ -325,48 +347,74 @@ function applyGameflowPhase(phase: GameflowPhase) {
     appStore.logLine(`gameflow: ${prev} → ${phase}`);
   }
   dispatchMachine({ type: "PHASE", phase });
-
-  if (phase === "EndOfGame" || phase === "WaitingForStats") {
-    appStore.update({ sessionEndPending: true });
-  }
 }
 
 export async function onLobbyChanged() {
   await getHostAdapter().eventBus.notifyLobbySignal?.();
 }
 
-let lastReconcileAt = 0;
-let lastFreeSeats: number | null = null;
+let partyReconcileTimer: ReturnType<typeof setTimeout> | null = null;
 
-async function maybeReconcileSlots(cap: LobbyCapability) {
+function schedulePartyReconcile() {
+  if (appStore.state.flags?.partySync === false) return;
+  const s = status();
+  if (
+    s !== ListingStatus.LISTED &&
+    s !== ListingStatus.FILLING &&
+    s !== ListingStatus.PAUSED
+  ) {
+    return;
+  }
+  if (partyReconcileTimer) clearTimeout(partyReconcileTimer);
+  partyReconcileTimer = setTimeout(() => {
+    partyReconcileTimer = null;
+    const party = appStore.state.party;
+    if (party) void reconcilePartyNow(party);
+  }, 1500);
+}
+
+async function reconcilePartyNow(party: PartyState) {
   const listingId = appStore.state.listing.id;
   const s = status();
   if (
     !listingId ||
+    party.queueId == null ||
     (s !== ListingStatus.LISTED &&
       s !== ListingStatus.FILLING &&
       s !== ListingStatus.PAUSED)
   ) {
     return;
   }
-  if (lastFreeSeats === cap.freeSeats) return;
-  const now = Date.now();
-  if (now - lastReconcileAt < 1500) return;
-  lastReconcileAt = now;
-  lastFreeSeats = cap.freeSeats;
-
   try {
-    const { reconcileListingSlots } = await import("../api/session");
-    const summary = await reconcileListingSlots(listingId, cap.freeSeats);
+    const { reconcileListingParty } = await import("../api/session");
+    const beforeQueue = appStore.state.myListing?.queueId;
+    const summary = await reconcileListingParty(listingId, {
+      partyId: party.partyId,
+      queueId: party.queueId,
+      members: party.members.map((m) => ({
+        puuid: m.puuid,
+        summonerId: m.summonerId,
+        roles: m.roles,
+        isLeader: m.isLeader,
+      })),
+      filledRoles: party.filledRoles,
+      phase: party.phase,
+    });
+    const drifted =
+      summary.status === ListingStatus.DELISTED &&
+      beforeQueue != null &&
+      party.queueId !== beforeQueue;
     appStore.update({
       myListing: summary,
+      queueDrift: drifted || appStore.state.queueDrift,
       listing: { status: summary.status as ListingStatus, id: summary.id },
     });
-    if (summary.status === ListingStatus.PAUSED && cap.freeSeats === 0) {
+    if (summary.status === ListingStatus.PAUSED) {
       appStore.logLine("listing paused — lobby full");
     }
+    if (drifted) appStore.logLine("listing delisted — queue changed");
   } catch (e: any) {
-    appStore.logLine(`reconcile slots: ${e?.message ?? e}`);
+    appStore.logLine(`reconcile party: ${e?.message ?? e}`);
   }
 }
 
@@ -385,7 +433,6 @@ export function applyLobby(lobby: unknown) {
       publishDraft: null,
     });
     if (prev != null) appStore.logLine("lobby closed");
-    lastFreeSeats = null;
     const s = status();
     if (
       s === ListingStatus.LISTED ||
@@ -423,8 +470,6 @@ export function applyLobby(lobby: unknown) {
     publishDraft: nextDraft,
   });
 
-  if (cap) void maybeReconcileSlots(cap);
-
   const q = cap?.queueId ?? null;
   if (prevCap?.queueId !== q) {
     appStore.logLine(
@@ -451,7 +496,10 @@ function wireTracker() {
     }
     applyGameflowPhase(edge.to);
   });
-  gameFlowTracker.onParty((party) => appStore.update({ party }));
+  gameFlowTracker.onParty((party) => {
+    appStore.update({ party });
+    schedulePartyReconcile();
+  });
   gameFlowTracker.onGameStarted((ctx) => appStore.update({ gameContext: ctx }));
 
   // LCU gone → forget tracked state so the reconnect replays every phase.

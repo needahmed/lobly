@@ -1,13 +1,16 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
+  Inject,
   Injectable,
   NotFoundException,
-  Inject,
   Optional,
+  forwardRef,
 } from "@nestjs/common";
+import { EventEmitter2 } from "@nestjs/event-emitter";
 import { InjectRepository } from "@nestjs/typeorm";
-import { In, Repository } from "typeorm";
+import { In, Not, Repository } from "typeorm";
 import type Redis from "ioredis";
 import { BLOCKED_PLATFORMS } from "@lobly/riot-client";
 import {
@@ -20,12 +23,14 @@ import {
   newSlotId,
   queueMetaFromQueueId,
   type ListingFilters,
+  type ListingParty,
+  type ListingPartyMember,
   type ListingQueueMeta,
   type ListingSlot,
   type ListingSummary,
   type Role,
 } from "@lobly/shared-types";
-import { Listing, RiotAccount, User } from "../../database/entities";
+import { JoinRequest, Listing, RiotAccount, User } from "../../database/entities";
 import { containsProfanity } from "../../common/profanity";
 import { ProfileService } from "../profile/profile.service";
 import { CreateListingDto, ListingStateDto, PatchListingDto } from "./dto/listing.dto";
@@ -43,6 +48,41 @@ const EVENT_TO_STATUS: Record<ListingStateDto["event"], ListingStatus> = {
 
 const ROLES = new Set<Role>(["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]);
 
+/** Pause written by reconcileParty when the League lobby has no free seats. */
+const LOBBY_FULL_PAUSE = "LOBBY_FULL";
+
+interface PartyConfirm {
+  confirmLobbyFromParty(listing: Listing, memberAccountIds: string[]): Promise<void>;
+}
+
+function joinServiceToken(): abstract new (...args: never[]) => PartyConfirm {
+  return require("../join/join.service").JoinService;
+}
+
+const RELIST_TTL_MS = 30 * 60 * 1000;
+
+interface BoardFanout {
+  emitBoardUpsert(
+    platform: string,
+    queueId: number | undefined,
+    row: unknown
+  ): Promise<void>;
+  emitBoardRemove?(
+    platform: string,
+    queueId: number | undefined,
+    listingId: string
+  ): Promise<void>;
+  emitListingState?(
+    creatorAccountId: string,
+    payload: { listingId: string; status: string; reason?: string }
+  ): Promise<void>;
+}
+
+function boardFanoutToken(): abstract new (...args: never[]) => BoardFanout {
+  // Lazy so this module does not import the gateway graph at load time.
+  return require("../realtime/realtime-fanout.service").RealtimeFanoutService;
+}
+
 @Injectable()
 export class ListingsService {
   constructor(
@@ -52,7 +92,16 @@ export class ListingsService {
     private readonly profiles: ProfileService,
     private readonly boardCache: BoardCacheService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
-    @Optional() private readonly metrics?: MetricsService
+    @Inject(forwardRef(() => boardFanoutToken()))
+    private readonly fanout: BoardFanout,
+    private readonly events: EventEmitter2,
+    @Optional() private readonly metrics?: MetricsService,
+    @Optional()
+    @InjectRepository(JoinRequest)
+    private readonly joinRequests?: Repository<JoinRequest>,
+    @Optional()
+    @Inject(forwardRef(() => joinServiceToken()))
+    private readonly partyJoins?: PartyConfirm
   ) {}
 
   async create(
@@ -175,6 +224,13 @@ export class ListingsService {
     dto: PatchListingDto
   ): Promise<ListingSummary> {
     const row = await this.requireOwned(userId, id);
+    if (
+      row.status !== ListingStatus.LISTED &&
+      row.status !== ListingStatus.FILLING &&
+      row.status !== ListingStatus.PAUSED
+    ) {
+      throw new BadRequestException({ code: "LISTING_CLOSED" });
+    }
     if (dto.title !== undefined) {
       if (containsProfanity(dto.title)) {
         throw new BadRequestException({ code: "PROFANITY" });
@@ -191,7 +247,8 @@ export class ListingsService {
     if (dto.slots !== undefined) {
       row.slots = this.normalizeAndValidateSlots(
         dto.slots,
-        row.queueMeta ?? queueMetaFromQueueId(row.queueId)
+        row.queueMeta ?? queueMetaFromQueueId(row.queueId),
+        row.slots
       );
     }
     if (dto.voiceRequired !== undefined) row.voiceRequired = dto.voiceRequired;
@@ -201,7 +258,11 @@ export class ListingsService {
     }
     const saved = await this.listings.save(row);
     await this.boardCache.invalidate(saved.platform);
-    return this.toSummary(saved);
+    const summary = this.toSummary(saved);
+    await this.fanout.emitBoardUpsert(saved.platform, saved.queueId, {
+      listing: summary,
+    });
+    return summary;
   }
 
   async applyState(
@@ -233,26 +294,55 @@ export class ListingsService {
     event: ListingStateDto["event"],
     phase?: string
   ): Promise<ListingSummary> {
-    if (
-      phase &&
+    const forcePause =
+      !!phase &&
       ["ChampSelect", "GameStart", "InProgress"].includes(phase) &&
-      event !== "delist"
-    ) {
-      row.status = ListingStatus.PAUSED;
-      row.pausedAt = new Date();
-    } else {
-      const next = EVENT_TO_STATUS[event];
-      row.status = next;
-      if (next === ListingStatus.PAUSED) row.pausedAt = new Date();
-      if (next === ListingStatus.DELISTED) row.delistedAt = new Date();
-      if (next === ListingStatus.LISTED) {
-        row.pausedAt = null;
-        row.delistedAt = null;
+      event !== "delist";
+    const effective: ListingStateDto["event"] = forcePause ? "pause" : event;
+    this.assertTransition(row, effective);
+
+    if (effective === "relist") {
+      const other = await this.listings.findOne({
+        where: {
+          creatorAccountId: row.creatorAccountId,
+          status: In([...ACTIVE_LISTING_STATUSES]),
+          id: Not(row.id),
+        },
+      });
+      if (other) {
+        throw new ConflictException({ code: "ACTIVE_LISTING_EXISTS" });
+      }
+      if (row.expiresAt.getTime() <= Date.now()) {
+        row.expiresAt = new Date(Date.now() + RELIST_TTL_MS);
       }
     }
 
-    const saved = await this.listings.save(row);
+    const next = EVENT_TO_STATUS[effective];
+    row.status = next;
+    if (next === ListingStatus.PAUSED) {
+      row.pausedAt = new Date();
+      row.pauseReason = null;
+    }
+    if (next === ListingStatus.DELISTED) row.delistedAt = new Date();
+    if (next === ListingStatus.LISTED) {
+      row.pausedAt = null;
+      row.delistedAt = null;
+      row.pauseReason = null;
+    }
+
+    let saved: Listing;
+    try {
+      saved = await this.listings.save(row);
+    } catch (err) {
+      if (isPgUniqueViolation(err)) {
+        throw new ConflictException({ code: "ACTIVE_LISTING_EXISTS" });
+      }
+      throw err;
+    }
     await this.boardCache.invalidate(saved.platform);
+    if (saved.status === ListingStatus.DELISTED) {
+      this.emitListingClosed(saved.id, "DELISTED");
+    }
     return this.toSummary(saved);
   }
 
@@ -274,52 +364,146 @@ export class ListingsService {
   }
 
   /**
-   * Reconcile open slots with free seats observed in the League lobby.
-   * Closes surplus open slots (or opens new any-role slots) so the board
-   * reflects reality when people join/leave outside LOBLY.
+   * Keep a live listing aligned with the creator's League party.
+   * Steps match 04_LOBBY_SYNC_AND_POSTGAME.md §3.2.4.
    */
-  async reconcileSlots(
+  async reconcileParty(
     userId: string,
     listingId: string,
-    freeSeats: number
+    dto: {
+      partyId?: string | null;
+      queueId: number;
+      members: { puuid: string; summonerId: number; roles: Role[]; isLeader: boolean }[];
+      filledRoles: Role[];
+      phase: string;
+    }
   ): Promise<ListingSummary> {
     const row = await this.requireOwned(userId, listingId);
-    const seats = Math.max(0, Math.min(4, Math.floor(freeSeats)));
-    let slots = normalizeSlots(row.slots);
-    const openCount = slots.filter((s) => s.open).length;
+    const ownerPuuid = row.creatorAccount?.lcuPuuid ?? null;
+    if (!ownerPuuid || !dto.members.some((m) => m.puuid === ownerPuuid)) {
+      throw new ForbiddenException({ code: "NOT_IN_PARTY" });
+    }
 
-    if (seats === 0) {
-      // Lobby full — pause so it disappears from candidates
-      row.status = ListingStatus.PAUSED;
-      row.pausedAt = new Date();
-      slots = slots.map((s) =>
-        s.open ? { ...s, open: false, pendingAccountId: null } : s
-      );
-    } else if (openCount > seats) {
-      let toClose = openCount - seats;
-      slots = slots.map((s) => {
-        if (s.open && toClose > 0) {
-          toClose -= 1;
-          return { ...s, open: false, pendingAccountId: null };
-        }
-        return s;
+    const custom = Boolean(row.queueMeta?.isCustom) || dto.queueId === 0 || dto.queueId === -1;
+    const memberCap = custom ? 8 : 5;
+    if (dto.members.length > memberCap) {
+      throw new BadRequestException({ code: "TOO_MANY_MEMBERS" });
+    }
+
+    if (dto.queueId !== row.queueId) {
+      const summary = await this.applyStateInternal(row, "delist");
+      await this.fanout.emitBoardRemove?.(row.platform, row.queueId, row.id);
+      await this.fanout.emitListingState?.(row.creatorAccountId, {
+        listingId: row.id,
+        status: ListingStatus.DELISTED,
+        reason: "QUEUE_CHANGED",
       });
-    } else if (openCount < seats) {
-      const toAdd = seats - openCount;
-      for (let i = 0; i < toAdd; i++) {
-        slots.push({
-          id: newSlotId(),
-          roles: [],
-          open: true,
-          pendingAccountId: null,
-        });
+      return summary;
+    }
+
+    const live =
+      row.status === ListingStatus.LISTED ||
+      row.status === ListingStatus.FILLING ||
+      row.status === ListingStatus.PAUSED;
+
+    const mapped = await this.mapPartyMembers(row, dto.members);
+    row.party = {
+      partyId: dto.partyId ?? null,
+      members: mapped,
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (live) {
+      const positional = Boolean(row.queueMeta?.positional);
+      if (positional) {
+        row.slots = reconcilePositionalSlots(normalizeSlots(row.slots), dto.filledRoles);
+      }
+      const maxLobby = row.queueMeta?.maxLobbySize ?? 5;
+      const full = dto.members.length >= maxLobby;
+      if (full && (row.status === ListingStatus.LISTED || row.status === ListingStatus.FILLING)) {
+        row.status = ListingStatus.PAUSED;
+        row.pausedAt = new Date();
+        row.pauseReason = LOBBY_FULL_PAUSE;
+      } else if (
+        !full &&
+        row.status === ListingStatus.PAUSED &&
+        row.pauseReason === LOBBY_FULL_PAUSE
+      ) {
+        row.status = ListingStatus.LISTED;
+        row.pausedAt = null;
+        row.pauseReason = null;
       }
     }
 
-    row.slots = slots;
-    const saved = await this.listings.save(row);
+    let saved = await this.listings.save(row);
+    const memberAccountIds = mapped
+      .map((m) => m.accountId)
+      .filter((id): id is string => Boolean(id));
+    if (live && memberAccountIds.length && this.partyJoins) {
+      await this.partyJoins.confirmLobbyFromParty(saved, memberAccountIds);
+      saved =
+        (await this.listings.findOne({
+          where: { id: saved.id },
+          relations: { creatorAccount: true },
+        })) ?? saved;
+    }
+
     await this.boardCache.invalidate(saved.platform);
-    return this.toSummary(saved);
+    const summary = this.toSummary(saved);
+    await this.fanout.emitBoardUpsert(saved.platform, saved.queueId, { listing: summary });
+    await this.fanout.emitListingState?.(saved.creatorAccountId, {
+      listingId: saved.id,
+      status: saved.status,
+    });
+    return summary;
+  }
+
+  private async mapPartyMembers(
+    row: Listing,
+    members: { puuid: string; summonerId: number; roles: Role[]; isLeader: boolean }[]
+  ): Promise<ListingPartyMember[]> {
+    const puuids = members.map((m) => m.puuid).filter(Boolean);
+    const linked = puuids.length
+      ? await this.accounts.find({ where: { lcuPuuid: In(puuids) } })
+      : [];
+    const byPuuid = new Map(
+      linked.filter((a) => a.lcuPuuid).map((a) => [a.lcuPuuid as string, a])
+    );
+
+    const invitedBySummoner = new Map<string, RiotAccount>();
+    if (this.joinRequests) {
+      const joins = await this.joinRequests.find({
+        where: {
+          listingId: row.id,
+          status: In(["PENDING", "ACCEPTED", "COMPLETED"]),
+        },
+        relations: { requesterAccount: true },
+      });
+      for (const join of joins) {
+        const acc = join.requesterAccount;
+        if (acc?.summonerId != null) invitedBySummoner.set(String(acc.summonerId), acc);
+      }
+    }
+
+    return members.map((member) => {
+      const account =
+        byPuuid.get(member.puuid) ?? invitedBySummoner.get(String(member.summonerId)) ?? null;
+      if (!account) {
+        return {
+          accountId: null,
+          riotId: null,
+          roles: member.roles,
+          isLeader: member.isLeader,
+        };
+      }
+      const riotId = account.tagLine ? `${account.riotId}#${account.tagLine}` : account.riotId;
+      return {
+        accountId: account.id,
+        riotId,
+        roles: member.roles,
+        isLeader: member.isLeader,
+      };
+    });
   }
 
   async pauseStalePresence(creatorAccountId: string): Promise<Listing | null> {
@@ -336,6 +520,7 @@ export class ListingsService {
     if (!row) return null;
     row.status = ListingStatus.PAUSED;
     row.pausedAt = new Date();
+    row.pauseReason = null;
     const saved = await this.listings.save(row);
     await this.boardCache.invalidate(saved.platform);
     return saved;
@@ -360,8 +545,16 @@ export class ListingsService {
       row.delistedAt = new Date();
       await this.listings.save(row);
       await this.boardCache.invalidate(row.platform);
+      this.emitListingClosed(row.id, "LISTING_EXPIRED");
     }
     return due;
+  }
+
+  emitListingClosed(
+    listingId: string,
+    code: "DELISTED" | "LISTING_EXPIRED" | "LOBBY_FULL"
+  ): void {
+    this.events.emit("listing.closed", { listingId, code });
   }
 
   toSummary(row: Listing): ListingSummary {
@@ -385,6 +578,7 @@ export class ListingsService {
       expiresAt: row.expiresAt.toISOString(),
       createdAt: row.createdAt.toISOString(),
       queueMeta,
+      party: normalizeParty(row.party),
     };
   }
 
@@ -414,7 +608,8 @@ export class ListingsService {
 
   private normalizeAndValidateSlots(
     raw: CreateListingDto["slots"] | PatchListingDto["slots"],
-    meta: ListingQueueMeta
+    meta: ListingQueueMeta,
+    existing?: ListingSlot[]
   ): ListingSlot[] {
     if (!raw?.length) {
       throw new BadRequestException({ code: "NO_SLOTS" });
@@ -427,9 +622,21 @@ export class ListingsService {
       });
     }
 
-    const slots: ListingSlot[] = raw.map((s, i) => {
+    const previous = normalizeSlots(existing ?? []);
+    const incomingIds = new Set(
+      raw
+        .map((s) => (s.id && typeof s.id === "string" ? s.id : ""))
+        .filter((id) => id.length > 0)
+    );
+    for (const ex of previous) {
+      if (ex.pendingAccountId && !incomingIds.has(ex.id)) {
+        throw new ConflictException({ code: "SLOT_HAS_PENDING_JOIN" });
+      }
+    }
+    const previousById = new Map(previous.map((s) => [s.id, s]));
+
+    const slots: ListingSlot[] = raw.map((s) => {
       const roles = (s.roles ?? []).filter((r): r is Role => ROLES.has(r as Role));
-      // Deduplicate while preserving order
       const seen = new Set<Role>();
       const uniq: Role[] = [];
       for (const r of roles) {
@@ -438,18 +645,65 @@ export class ListingsService {
           uniq.push(r);
         }
       }
+      const id = s.id && typeof s.id === "string" ? s.id : newSlotId();
+      const prev = previousById.get(id);
+      if (prev?.pendingAccountId) {
+        return {
+          id,
+          roles: uniq,
+          open: false,
+          pendingAccountId: prev.pendingAccountId,
+          ...(prev.closedReason ? { closedReason: prev.closedReason } : {}),
+        };
+      }
+      const open = Boolean(s.open);
       return {
-        id: s.id && typeof s.id === "string" ? s.id : newSlotId(),
+        id,
         roles: uniq,
-        open: Boolean(s.open),
-        pendingAccountId: s.pendingAccountId ?? null,
+        open,
+        pendingAccountId: null,
+        ...(!open && prev?.closedReason ? { closedReason: prev.closedReason } : {}),
       };
     });
 
-    if (!slots.some((s) => s.open)) {
+    if (!slots.some((s) => s.open) && !slots.some((s) => s.pendingAccountId)) {
       throw new BadRequestException({ code: "NO_OPEN_SLOTS" });
     }
     return slots;
+  }
+
+  private assertTransition(row: Listing, event: ListingStateDto["event"]): void {
+    const status = row.status;
+    let ok = false;
+    switch (event) {
+      case "pause":
+        ok =
+          status === ListingStatus.LISTED ||
+          status === ListingStatus.FILLING ||
+          status === ListingStatus.READY;
+        break;
+      case "relist":
+        if (status === ListingStatus.PAUSED || status === ListingStatus.POST_SESSION) {
+          ok = true;
+        } else if (status === ListingStatus.DELISTED) {
+          ok = row.expiresAt.getTime() > Date.now();
+        }
+        break;
+      case "delist":
+        ok = status !== ListingStatus.DELISTED;
+        break;
+      case "ready":
+        ok = status === ListingStatus.FILLING;
+        break;
+      case "reopen":
+        ok = status === ListingStatus.READY || status === ListingStatus.FILLING;
+        break;
+      default:
+        ok = false;
+    }
+    if (!ok) {
+      throw new ConflictException({ code: "INVALID_TRANSITION" });
+    }
   }
 
   private async requireOwned(userId: string, id: string): Promise<Listing> {
@@ -463,4 +717,61 @@ export class ListingsService {
     }
     return row;
   }
+
+  /** Delist the account's active listing through the normal delist transition. */
+  async delistActiveForAccount(accountId: string): Promise<void> {
+    const row = await this.listings.findOne({
+      where: {
+        creatorAccountId: accountId,
+        status: In([...ACTIVE_LISTING_STATUSES]),
+      },
+    });
+    if (!row) return;
+    const summary = await this.applyStateInternal(row, "delist");
+    const fanout = this.fanout as BoardFanout & {
+      emitBoardRemove?: (
+        platform: string,
+        queueId: number | undefined,
+        listingId: string
+      ) => Promise<void>;
+    };
+    await fanout.emitBoardRemove?.(summary.platform, summary.queueId, summary.id);
+  }
+}
+
+function roleCovered(slot: ListingSlot, filled: Set<Role>): boolean {
+  if (!slot.roles.length) return false;
+  return slot.roles.every((role) => filled.has(role));
+}
+
+/** Close open slots whose roles are all filled. Reopen only FILLED_IN_CLIENT. */
+function reconcilePositionalSlots(slots: ListingSlot[], filledRoles: Role[]): ListingSlot[] {
+  const filled = new Set(filledRoles);
+  return slots.map((slot) => {
+    if (slot.pendingAccountId) return slot;
+    const covered = roleCovered(slot, filled);
+    if (slot.open && covered) {
+      return { ...slot, open: false, closedReason: "FILLED_IN_CLIENT" as const };
+    }
+    if (!slot.open && slot.closedReason === "FILLED_IN_CLIENT" && !covered) {
+      return {
+        id: slot.id,
+        roles: slot.roles,
+        open: true,
+        pendingAccountId: slot.pendingAccountId ?? null,
+      };
+    }
+    return slot;
+  });
+}
+
+function normalizeParty(raw: ListingParty | null | undefined): ListingParty | null {
+  if (!raw || typeof raw !== "object" || !Array.isArray(raw.members)) return null;
+  return raw;
+}
+
+function isPgUniqueViolation(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { code?: string; driverError?: { code?: string } };
+  return e.code === "23505" || e.driverError?.code === "23505";
 }

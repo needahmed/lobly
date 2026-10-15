@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "endpoints": {
     "currentSummoner": { "method": "GET", "path": "/lol-summoner/v1/current-summoner" },
     "regionLocale": { "method": "GET", "path": "/riotclient/region-locale" },
@@ -14,6 +14,14 @@
     "acceptInvitation": {
       "method": "POST",
       "path": "/lol-lobby/v2/received-invitations/{invitationId}/accept"
+    },
+    "setSummonerIcon": {
+      "method": "PUT",
+      "path": "/lol-summoner/v1/current-summoner/icon"
+    },
+    "readyCheckAccept": {
+      "method": "POST",
+      "path": "/lol-matchmaking/v1/ready-check/accept"
     }
   },
   "wsEvents": {

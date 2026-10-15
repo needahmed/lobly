@@ -46,10 +46,6 @@ class SlotDto {
 
   @IsBoolean()
   open!: boolean;
-
-  @IsOptional()
-  @IsUUID()
-  pendingAccountId?: string | null;
 }
 
 class FiltersDto {
@@ -203,6 +199,48 @@ export class PatchListingDto {
   @IsArray()
   @IsString({ each: true })
   languages?: string[];
+}
+
+class PartyMemberDto {
+  @IsString()
+  @MaxLength(80)
+  puuid!: string;
+
+  @IsInt()
+  summonerId!: number;
+
+  @IsArray()
+  @ArrayMaxSize(5)
+  @IsIn([...ROLES], { each: true })
+  roles!: (typeof ROLES)[number][];
+
+  @IsBoolean()
+  isLeader!: boolean;
+}
+
+export class ReconcilePartyDto {
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  partyId?: string | null;
+
+  @IsInt()
+  queueId!: number;
+
+  @IsArray()
+  @ArrayMaxSize(8)
+  @ValidateNested({ each: true })
+  @Type(() => PartyMemberDto)
+  members!: PartyMemberDto[];
+
+  @IsArray()
+  @ArrayMaxSize(5)
+  @IsIn([...ROLES], { each: true })
+  filledRoles!: (typeof ROLES)[number][];
+
+  @IsString()
+  @MaxLength(40)
+  phase!: string;
 }
 
 export class ListingStateDto {

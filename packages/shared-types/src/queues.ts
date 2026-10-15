@@ -88,6 +88,19 @@ export function isPublishableQueue(queueId: number | null | undefined): boolean 
   return true;
 }
 
+/**
+ * Queues that must not create reputation. Practice tool and custom games
+ * are not in match-v5 (queue id 0 / -1). Tutorials are.
+ */
+const NON_REPUTATION_QUEUE_IDS = new Set<number>([0, -1, 2000, 2010, 2020]);
+
+export function isReputationQueue(queueId: number | null | undefined): boolean {
+  if (!isPublishableQueue(queueId)) return false;
+  if (queueId == null || queueId <= 0) return false;
+  if (NON_REPUTATION_QUEUE_IDS.has(queueId)) return false;
+  return true;
+}
+
 export function getQueueIdFromLobby(lobby: LcuLobbyLike | null | undefined): number | null {
   if (!lobby) return null;
   const q = lobby.gameConfig?.queueId ?? lobby.queueId;

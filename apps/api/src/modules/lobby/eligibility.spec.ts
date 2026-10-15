@@ -279,6 +279,23 @@ describe("evaluateEligibility", () => {
     expect(r.reasons).toContain("BLOCKED");
   });
 
+  it("treats missing requester languages as no preference", () => {
+    const r = evaluateEligibility(baseListing, goldJungler, null, creatorGold);
+    expect(r.eligible).toBe(true);
+    expect(r.reasons).not.toContain("LANGUAGE_MISMATCH");
+  });
+
+  it("treats an empty requester language list as no preference", () => {
+    const r = evaluateEligibility(
+      baseListing,
+      goldJungler,
+      { ...prefs, languages: [] },
+      creatorGold
+    );
+    expect(r.eligible).toBe(true);
+    expect(r.reasons).not.toContain("LANGUAGE_MISMATCH");
+  });
+
   it("reliability floor skips New accounts", () => {
     const listing = {
       ...baseListing,

@@ -3,11 +3,13 @@ import { BullModule } from "@nestjs/bullmq";
 import { TypeOrmModule } from "@nestjs/typeorm";
 import {
   ChampionStat,
+  JoinRequest,
   Match,
   MatchParticipation,
   MatchSeen,
   ProfileSnapshot,
   RiotAccount,
+  Session,
   UserPrefs,
 } from "../../database/entities";
 import {
@@ -37,6 +39,8 @@ import { ReputationModule } from "../reputation/reputation.module";
       Match,
       MatchParticipation,
       UserPrefs,
+      Session,
+      JoinRequest,
     ]),
     BullModule.registerQueue(
       { name: PROFILE_INTERACTIVE_QUEUE },
@@ -54,6 +58,12 @@ import { ReputationModule } from "../reputation/reputation.module";
     ChampionsService,
     MatchHistoryService,
   ],
-  exports: [ProfileService, ProfileJobsService, ChampionsService, MatchHistoryService],
+  exports: [
+    ProfileService,
+    ProfileJobsService,
+    ProfileRefreshService,
+    ChampionsService,
+    MatchHistoryService,
+  ],
 })
 export class ProfileModule {}

@@ -1,4 +1,4 @@
-import { restoreWindow, isLeagueLauncherId } from "../../shared/ow";
+import { restoreWindow, showWindowBehind, isLeagueLauncherId } from "../../shared/ow";
 import { startLauncherEvents } from "../../modules/gep/launcherEvents";
 import { startGameEvents } from "../../modules/gep/gameEvents";
 import { clearCreds } from "../../modules/lcu/credentials";
@@ -20,6 +20,14 @@ import {
   publishWithDraft,
   wireListingMachineToBus,
   syncAgent,
+  startSessionBootstrap,
+  ensureSession,
+  signOut,
+  completeRiotSignIn,
+  linkAnotherAccount,
+  loadClientSettings,
+  watchClientSettings,
+  gameFlowTracker,
   type LoblyBridge,
 } from "@lobly/client-core";
 
@@ -38,11 +46,21 @@ function isDesktopHidden(): Promise<boolean> {
 async function boot() {
   // Overwolf's LCU access: fetch-based REST wrapper + GEP-driven event bus.
   // See 00_BUILD_OVERVIEW.md C1/C2/C13 for why this differs from Electron.
+  const devAuth = import.meta.env.VITE_LOBLY_DEV_AUTH === "1";
   configureLoblyCore({
     backendUrl: BACKEND_URL,
     lcuTransport: { request: lcuRequest },
     eventBus: lcuEventBus,
     isDesktopHidden,
+    showWindowInactive: () => {
+      void showWindowBehind("desktop");
+    },
+    isDevAuthEnabled: () => devAuth,
+    notify: (_title, _body, opts) => {
+      if (!appStore.state.notificationsEnabled) return;
+      void restoreWindow("notifications");
+      if (opts?.tab) appStore.update({ uiTab: opts.tab });
+    },
   });
 
   const bridge: LoblyBridge = {
@@ -66,6 +84,19 @@ async function boot() {
       const { declineJoin } = await import("@lobly/client-core");
       await declineJoin(joinRequestId);
     },
+    navigate: (tab) => appStore.update({ uiTab: tab }),
+    riotSignIn: async () => {
+      await completeRiotSignIn();
+    },
+    linkAnotherAccount: async () => {
+      await linkAnotherAccount();
+    },
+    devSignIn: async (email, password) => {
+      await ensureSession(email, password);
+    },
+    signOut: async () => {
+      await signOut();
+    },
     spike: {
       restGet: spikeRestGet,
       restPost: spikeRestPost,
@@ -80,24 +111,18 @@ async function boot() {
   void refreshEndpointsFromBackend();
   setInterval(() => void refreshEndpointsFromBackend(), 6 * 60 * 60 * 1000);
 
-  // Phase 2: prefer real JWT; fall back to mock-compatible token
-  void import("@lobly/client-core").then(async ({ ensureSession, linkCurrentSummoner }) => {
-    try {
-      await ensureSession("dev@lobly.local", "lobly-dev-password");
-      let lastPuuid: string | undefined;
-      appStore.subscribe(() => {
-        const puuid = appStore.state.summoner?.puuid;
-        if (!puuid || puuid === lastPuuid || appStore.state.riotAccountId) return;
-        lastPuuid = puuid;
-        void linkCurrentSummoner().catch((e) =>
-          appStore.logLine(`link: ${e?.message ?? e}`)
-        );
-      });
-    } catch (e: any) {
-      appStore.logLine(`API auth failed (${e?.message ?? e}) — using dev-local sync`);
-      syncAgent.connect("dev-local");
-    }
-  });
+  loadClientSettings();
+  watchClientSettings();
+  appStore.update({ devAuthEnabled: devAuth });
+  startSessionBootstrap(
+    devAuth
+      ? {
+          devAuth: true,
+          devEmail: "dev@lobly.local",
+          devPassword: "lobly-dev-password",
+        }
+      : undefined
+  );
 
   overwolf.extensions.onAppLaunchTriggered.addListener(() => {
     void restoreWindow("desktop");
@@ -114,6 +139,7 @@ async function boot() {
 
   overwolf.games.launchers.onTerminated.addListener((l) => {
     if (l?.id != null && !isLeagueLauncherId(l.id)) return;
+    gameFlowTracker.noteLauncherClosed();
     // Client gone → delist (no ghost listings; exit criterion 4)
     const st = appStore.state.listing.status;
     if (st !== "DRAFT" && st !== "DELISTED") {

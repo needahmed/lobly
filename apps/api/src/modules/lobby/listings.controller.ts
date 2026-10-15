@@ -8,21 +8,14 @@ import {
   Patch,
   Post,
 } from "@nestjs/common";
-import { IsInt, Max, Min } from "class-validator";
 import { CurrentUser, type JwtPayload } from "../../common/decorators/current-user.decorator";
 import {
   CreateListingDto,
   ListingStateDto,
   PatchListingDto,
+  ReconcilePartyDto,
 } from "./dto/listing.dto";
 import { ListingsService } from "./listings.service";
-
-class ReconcileSlotsDto {
-  @IsInt()
-  @Min(0)
-  @Max(10)
-  freeSeats!: number;
-}
 
 @Controller("listings")
 export class ListingsController {
@@ -51,13 +44,13 @@ export class ListingsController {
     return this.listings.patch(user.sub, id, body);
   }
 
-  @Post(":id/reconcile-slots")
-  reconcileSlots(
+  @Patch(":id/party")
+  reconcileParty(
     @CurrentUser() user: JwtPayload,
     @Param("id", ParseUUIDPipe) id: string,
-    @Body() body: ReconcileSlotsDto
+    @Body() body: ReconcilePartyDto
   ) {
-    return this.listings.reconcileSlots(user.sub, id, body.freeSeats);
+    return this.listings.reconcileParty(user.sub, id, body);
   }
 
   @Post(":id/state")
