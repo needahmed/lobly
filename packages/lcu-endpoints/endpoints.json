@@ -1,9 +1,12 @@
 {
-  "version": 1,
+  "version": 2,
   "endpoints": {
     "currentSummoner": { "method": "GET", "path": "/lol-summoner/v1/current-summoner" },
     "regionLocale": { "method": "GET", "path": "/riotclient/region-locale" },
     "gameflowPhase": { "method": "GET", "path": "/lol-gameflow/v1/gameflow-phase" },
+    "gameflowSession": { "method": "GET", "path": "/lol-gameflow/v1/session" },
+    "champSelectSession": { "method": "GET", "path": "/lol-champ-select/v1/session" },
+    "eogStatsBlock": { "method": "GET", "path": "/lol-end-of-game/v1/eog-stats-block" },
     "lobby": { "method": "GET", "path": "/lol-lobby/v2/lobby" },
     "lobbyMembers": { "method": "GET", "path": "/lol-lobby/v2/lobby/members" },
     "sendInvite": { "method": "POST", "path": "/lol-lobby/v2/lobby/invitations" },
@@ -15,6 +18,8 @@
   },
   "wsEvents": {
     "gameflowPhase": "OnJsonApiEvent_lol-gameflow_v1_gameflow-phase",
+    "gameflowSession": "OnJsonApiEvent_lol-gameflow_v1_session",
+    "champSelectSession": "OnJsonApiEvent_lol-champ-select_v1_session",
     "lobby": "OnJsonApiEvent_lol-lobby_v2_lobby"
   }
 }

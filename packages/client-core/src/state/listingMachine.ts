@@ -10,6 +10,8 @@ import { appStore } from "./store";
 import { syncAgent } from "../sync/syncAgent";
 import { getHostAdapter } from "../hostAdapter";
 import { getBridge } from "../shared/bridge";
+import { gameFlowTracker } from "../lcu/gameFlowTracker";
+import { isLobbyShaped } from "../lcu/partyReducer";
 import {
   defaultDraft,
   draftToCreateBody,
@@ -306,7 +308,17 @@ export function dispatchMachine(event: MachineEvent) {
   }
 }
 
+/**
+ * Entry point for a bare gameflow phase from any source (GEP game_flow, the
+ * /gameflow-phase WS event, REST seeding). Routed through the tracker so that
+ * repeats from several channels reach the listing machine once per change.
+ */
 export function onGameflowPhase(phase: GameflowPhase) {
+  void gameFlowTracker.ingest("phase", phase);
+}
+
+/** Applies a phase change the tracker has already de-duplicated. */
+function applyGameflowPhase(phase: GameflowPhase) {
   const prev = appStore.state.gameflowPhase;
   if (prev !== phase) {
     appStore.update({ gameflowPhase: phase });
@@ -321,12 +333,6 @@ export function onGameflowPhase(phase: GameflowPhase) {
 
 export async function onLobbyChanged() {
   await getHostAdapter().eventBus.notifyLobbySignal?.();
-}
-
-function isLobbyShaped(v: unknown): boolean {
-  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
-  const l = v as any;
-  return l.gameConfig != null || l.queueId != null || l.partyId != null;
 }
 
 let lastReconcileAt = 0;
@@ -430,30 +436,90 @@ export function applyLobby(lobby: unknown) {
   }
 }
 
-export function wireListingMachineToBus() {
-  const bus = getHostAdapter().eventBus;
-  bus.on("lobby", applyLobby);
-  bus.on("phase", (phase) => {
-    if (typeof phase === "string") onGameflowPhase(phase as GameflowPhase);
+let trackerWired = false;
+
+function wireTracker() {
+  if (trackerWired) return;
+  trackerWired = true;
+  gameFlowTracker.configure({
+    fetch: (endpoint) => getHostAdapter().lcuTransport.request<unknown>(endpoint),
+    log: (line) => appStore.logLine(line),
   });
+  gameFlowTracker.onPhase((edge) => {
+    if (!edge.legal) {
+      appStore.logLine(`gameflow edge ${edge.from} → ${edge.to} outside transition table`);
+    }
+    applyGameflowPhase(edge.to);
+  });
+  gameFlowTracker.onParty((party) => appStore.update({ party }));
+  gameFlowTracker.onGameStarted((ctx) => appStore.update({ gameContext: ctx }));
+
+  // LCU gone → forget tracked state so the reconnect replays every phase.
+  let wasConnected = appStore.state.lcu.connected;
+  appStore.subscribe(() => {
+    const connected = appStore.state.lcu.connected;
+    if (wasConnected && !connected) void gameFlowTracker.reset();
+    wasConnected = connected;
+  });
+}
+
+export function wireListingMachineToBus() {
+  wireTracker();
+  const bus = getHostAdapter().eventBus;
+  bus.on("lobby", (lobby) => {
+    applyLobby(lobby);
+    void gameFlowTracker.ingest("lobby", lobby);
+  });
+  bus.on("phase", (phase) => void gameFlowTracker.ingest("phase", phase));
+  bus.on("gameflowSession", (s) => void gameFlowTracker.ingest("gameflowSession", s));
+  bus.on("champSelect", (cs) => void gameFlowTracker.ingest("champSelect", cs));
   bus.start();
 }
 
+/**
+ * Re-read everything the push channels would otherwise only report as
+ * changes: on (re)connect, the user may already be in a lobby or a game.
+ * The gameflow session is the source of truth for phase, queue and gameId;
+ * the bare phase endpoint is only the fallback when it can't be read.
+ */
 export async function refreshLcuState(): Promise<void> {
+  wireTracker();
   const transport = getHostAdapter().lcuTransport;
 
+  let sessionRead = false;
   try {
-    const phase = await transport.request<string | null>("gameflowPhase");
-    if (typeof phase === "string" && phase) {
-      onGameflowPhase(phase as GameflowPhase);
-    }
+    const session = await transport.request<unknown>("gameflowSession");
+    await gameFlowTracker.ingest("gameflowSession", session);
+    sessionRead = true;
   } catch (e: any) {
-    appStore.logLine(`phase read failed: ${e?.message ?? e}`);
+    appStore.logLine(`gameflow session read failed: ${e?.message ?? e}`);
+  }
+
+  if (!sessionRead) {
+    try {
+      const phase = await transport.request<string | null>("gameflowPhase");
+      if (typeof phase === "string" && phase) {
+        await gameFlowTracker.ingest("phase", phase);
+      }
+    } catch (e: any) {
+      appStore.logLine(`phase read failed: ${e?.message ?? e}`);
+    }
   }
 
   try {
-    applyLobby(await transport.request<unknown>("lobby"));
+    const lobby = await transport.request<unknown>("lobby");
+    applyLobby(lobby);
+    await gameFlowTracker.ingest("lobby", lobby);
   } catch (e: any) {
     appStore.logLine(`lobby read failed: ${e?.message ?? e}`);
+  }
+
+  if (gameFlowTracker.getState().phase === "ChampSelect") {
+    try {
+      const cs = await transport.request<unknown>("champSelectSession");
+      await gameFlowTracker.ingest("champSelect", cs);
+    } catch (e: any) {
+      appStore.logLine(`champ select read failed: ${e?.message ?? e}`);
+    }
   }
 }

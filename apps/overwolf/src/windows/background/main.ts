@@ -3,7 +3,7 @@ import { startLauncherEvents } from "../../modules/gep/launcherEvents";
 import { startGameEvents } from "../../modules/gep/gameEvents";
 import { clearCreds } from "../../modules/lcu/credentials";
 import { lcuRequest } from "../../modules/lcu/request";
-import { gepEventBus } from "../../modules/lcu/eventBus";
+import { lcuEventBus } from "../../modules/lcu/eventBus";
 import { refreshEndpointsFromBackend } from "../../modules/lcu/endpoints";
 import {
   spikeRestGet,
@@ -41,7 +41,7 @@ async function boot() {
   configureLoblyCore({
     backendUrl: BACKEND_URL,
     lcuTransport: { request: lcuRequest },
-    eventBus: gepEventBus,
+    eventBus: lcuEventBus,
     isDesktopHidden,
   });
 

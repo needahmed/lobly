@@ -4,6 +4,8 @@ import {
   type GameflowPhase,
   type LobbyCapability,
   type ListingSummary,
+  type GameContext,
+  type PartyState,
 } from "@lobly/shared-types";
 import type { PublishDraft } from "./publishDraft";
 
@@ -28,6 +30,10 @@ export interface AppState {
   };
   gameflowPhase: GameflowPhase;
   lobby?: unknown;
+  /** The user's own League party as seen by the GameFlowTracker. */
+  party?: PartyState | null;
+  /** Frozen when a game starts (input for the end-of-game loop). */
+  gameContext?: GameContext | null;
   /** Derived from the live League lobby gameConfig. */
   lobbyCapability?: LobbyCapability | null;
   listing: { status: ListingStatus; id?: string };
@@ -78,6 +84,8 @@ class Store {
     gameflowPhase: "None",
     listing: { status: ListingStatus.DRAFT },
     lobbyCapability: null,
+    party: null,
+    gameContext: null,
     publishDraft: null,
     myListing: null,
     gep: { features: [], active: false },
@@ -140,6 +148,7 @@ class Store {
       gameflowPhase: "None",
       lobby: undefined,
       lobbyCapability: null,
+      party: null,
     });
     this.logLine("LCU down — credentials cleared");
   }

@@ -26,6 +26,23 @@ export function DebugView({
     ["Linked account", state.riotAccountId ?? "not linked"],
     ["Listing", `${state.listing.status}${state.listing.id ? ` (${state.listing.id.slice(0, 8)})` : ""}`],
     ["GEP features", state.gep.active ? state.gep.features.join(", ") || "active" : "inactive"],
+    ["LCU WebSocket", state.wsAvailable ? "connected" : "not connected"],
+    [
+      "Party",
+      state.party?.members.length
+        ? state.party.members
+            .map((m) => {
+              const role = m.champSelect?.assignedRole ?? m.roles[0] ?? "FILL";
+              return `${m.riotId ?? `#${m.summonerId}`}${m.isLocal ? " (you)" : ""} · ${role}`;
+            })
+            .join(", ")
+        : "—",
+    ],
+    [
+      "Open roles",
+      state.party?.positional ? state.party.openRoles.join(", ") || "none" : "n/a",
+    ],
+    ["Game id", state.party?.gameId != null ? String(state.party.gameId) : "—"],
   ];
 
   return (

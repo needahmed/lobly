@@ -17,9 +17,30 @@ export function hasCreds(): boolean {
   return creds !== null;
 }
 
+type CredsListener = (creds: LcuCredentials | null) => void;
+const credsListeners = new Set<CredsListener>();
+
+/** Notified when credentials rotate (new client process) or are cleared. */
+export function onCredsChanged(fn: CredsListener): () => void {
+  credsListeners.add(fn);
+  return () => credsListeners.delete(fn);
+}
+
+function notifyCreds() {
+  for (const fn of credsListeners) {
+    try {
+      fn(creds);
+    } catch (e: any) {
+      appStore.logLine(`creds listener threw: ${e?.message ?? e}`);
+    }
+  }
+}
+
 export function clearCreds() {
+  const had = creds !== null;
   creds = null;
   pending = {};
+  if (had) notifyCreds();
   if (lockfileTimer) {
     clearTimeout(lockfileTimer);
     lockfileTimer = null;
@@ -40,6 +61,7 @@ export function onLcuCredentials(partial: Partial<LcuCredentials>) {
     if (changed) {
       appStore.logLine(`LCU credentials ready (port ${next.port})`);
       void verifySummoner();
+      notifyCreds();
     }
     if (lockfileTimer) {
       clearTimeout(lockfileTimer);

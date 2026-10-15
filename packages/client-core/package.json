@@ -7,9 +7,40 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "scripts": {
+    "test": "jest"
+  },
   "dependencies": {
     "@lobly/shared-types": "*",
     "react": "^18.3.1",
     "socket.io-client": "^4.8.1"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "rootDir": "src",
+    "testRegex": ".*\\.spec\\.ts$",
+    "moduleFileExtensions": [
+      "ts",
+      "js",
+      "json"
+    ],
+    "transform": {
+      "^.+\\.ts$": [
+        "ts-jest",
+        {
+          "tsconfig": {
+            "target": "ES2022",
+            "module": "commonjs",
+            "strict": true,
+            "esModuleInterop": true,
+            "skipLibCheck": true,
+            "isolatedModules": true
+          }
+        }
+      ]
+    },
+    "moduleNameMapper": {
+      "^@lobly/shared-types$": "<rootDir>/../../shared-types/src/index.ts"
+    }
   }
 }
